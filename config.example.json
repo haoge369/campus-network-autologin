@@ -1,0 +1,8 @@
+{
+  "userId": "YOUR_STUDENT_ID",
+  "password": "YOUR_PASSWORD",
+  "serverHost": "172.10.110.252",
+  "defaultQueryString": "wlanuserip=xxx&wlanacname=xxx&ssid=&nasip=xxx&snmpagentip=&mac=111111111&t=wireless-v2&url=xxx",
+  "retryCount": 3,
+  "retryDelayMs": 5000
+}
