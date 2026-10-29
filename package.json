@@ -1,0 +1,19 @@
+{
+  "name": "campus-network-autologin",
+  "version": "1.1.0",
+  "private": true,
+  "description": "锐捷 eportal 校园网自动登录（Windows，零依赖，含网卡禁用自愈与免 cmd.exe 启动器）",
+  "main": "campus_login.js",
+  "scripts": {
+    "check": "node --check campus_login.js && node --check network_client.js && node --check nic_ctl.js && node --check rsa_util.js",
+    "test": "node --test \"test/*.test.js\"",
+    "login": "node campus_login.js",
+    "login:force": "node campus_login.js --force",
+    "status": "node campus_login.js --status",
+    "diag": "node nic_ctl.js --diag"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
