@@ -11,6 +11,8 @@ Windows 上的免干预校园网登录工具：登录 Windows 后自动登录，
 - 网卡禁用自愈：设备管理器禁用（Code 22，`Enable-PnpDevice`）、网络连接禁用（`Enable-NetAdapter`）、
   卸载（`pnputil /scan-devices`）都能恢复；网卡启用后等 IP，必要时自动 `ipconfig /renew`
 - 不依赖 cmd.exe 的启动器 `run_now.vbs`：彻底规避 `cmd.exe - Application Error (0xc0000142)` 弹窗
+- **尊重手动禁用**：计划任务每次开机最多自动启用一次网卡；之后你手动禁用网卡不会被它反复拉起
+  （手动双击 `run_now.vbs` 仍会立刻启用并登录，下次开机恢复自动启用）
 - 计划任务以最高权限静默运行（登录后 15 秒首次，之后每 5 分钟重试、持续 2 小时；每天 06:10）
 - 单实例锁：多次双击也只会真正跑一个登录进程
 - 登录后二次校验，避免「接口说成功、实际没在线」的假成功
@@ -35,6 +37,7 @@ campus-network-autologin/
 ├── uninstall_tasks.ps1      # 删除计划任务
 ├── protect_password.ps1     # 用 DPAPI 加密 config.json 密码并收紧 ACL
 ├── config.example.json      # 配置模板（复制为 config.json 后修改）
+├── state.json               # 运行状态（记录本次开机是否已自动启用过网卡，自动生成）
 ├── package.json             # npm scripts（check / test / status / diag / login）
 ├── test/                    # node:test 单元测试
 └── .github/workflows/ci.yml # GitHub Actions
@@ -72,6 +75,7 @@ campus-network-autologin/
 | --- | --- |
 | 连一下网 | 双击 `run_now.vbs`（或桌面「校园网自动登录」快捷方式） |
 | 静默跑一次（无弹窗） | `wscript .\run_now.vbs /quiet` |
+| 保持网卡禁用不被自动拉起 | 直接禁用即可；计划任务每次开机只会自动启用一次（见「网卡自动启用」） |
 | 查当前状态 | `node .\campus_login.js --status` 或 `npm run status` |
 | 强制重新登录 | `node .\campus_login.js --force` |
 | 网卡诊断 | `node .\nic_ctl.js --diag` 或 `npm run diag` |
@@ -82,7 +86,7 @@ campus-network-autologin/
 `--status` 输出示例（一行 JSON，便于外部脚本消费）：
 
 ```json
-{"version":"1.1.0","time":"2026-10-29 18:20:03","serverHost":"172.10.110.252","adapterMatch":"Realtek PCIe 2.5GbE","nic":{"name":"以太网","address":"172.10.1.100","mac":"001122334455"},"ip":"172.10.1.100","online":true,"unreachable":false}
+{"version":"1.1.1","time":"2026-10-30 00:31:26","serverHost":"172.10.110.252","adapterMatch":"Realtek PCIe 2.5GbE","autoEnable":"once","nic":{"name":"以太网","state":"enabled","status":"Up","address":"172.10.1.100","mac":"001122334455"},"ip":"172.10.1.100","online":true,"unreachable":false}
 ```
 
 （示例中的 IP / MAC 为虚构值，避免泄露真实网络标识。）
@@ -100,6 +104,7 @@ campus-network-autologin/
 | `defaultQueryString` | 空 | 抓不到实时重定向参数时的兜底参数 |
 | `probeUrls` | 1.1.1.1 / miui / msftconnecttest | 兜底探测列表（先试 `serverHost` 本身） |
 | `adapterMatch` | `Realtek PCIe 2.5GbE` | 物理网卡匹配关键字（网卡名或描述，支持子串） |
+| `autoEnable` | `once` | 自动启用网卡的策略：`once` 每次开机最多自动启用一次；`always` 每次运行都启用（旧行为）；`never` 从不自动启用（仍会正常登录） |
 | `nicEnableWaitMs` | `60000` | 启用网卡后等待校园网 IP 的上限（毫秒） |
 | `retryCount` | `3` | 登录最多尝试次数 |
 | `retryDelayMs` | `15000` | 网络类失败的基础退避（毫秒，指数增长，上限 60 秒） |
@@ -143,6 +148,19 @@ Remove-Item .\config.json.plain.bak   # 确认无误后删除明文备份
 启用成功后等待 172.10.x.x 就绪；若 8 秒还没 IP，会每 15 秒执行一次 `ipconfig /renew`（最多 3 次）。
 计划任务本身以最高权限运行，所以自动启用不需要额外弹 UAC；**手动运行请用管理员身份**。
 
+### 手动禁用的网卡不会被反复启用
+
+计划任务的 `CampusLogin_AutoStartup` 会在登录后每 5 分钟重试、持续 2 小时。如果每次重试都去启用网卡，
+你手动禁用的网卡就会被反复拉起。现在的规则（`autoEnable: "once"`，默认）是：
+
+1. 每次开机后，**第一次**自动运行时允许启用网卡（覆盖“开机前网卡被禁用”的情况）；
+2. 之后把“本次开机已处理过网卡”记到 `state.json`；
+3. 你手动禁用网卡后，后续自动运行只写一行日志说明“尊重你的选择”，不会动网卡；
+4. 需要立刻上网时手动双击 `run_now.vbs`（不带 `--auto`，始终允许启用）；下次开机恢复自动启用。
+
+把 `autoEnable` 改成 `always` 可恢复“每次都启用”的旧行为，改成 `never` 则完全不自动启用网卡。
+`state.json` 记录 `bootId`（按开机时间+系统运行时长推算），重启后自动失效，无需手动清理。
+
 ## 计划任务
 
 `setup_tasks.ps1` 注册两个任务（均 `RunLevel Highest`、隐藏窗口、单实例 `IgnoreNew`、失败重启 3 次 / 5 分钟间隔）：
@@ -152,7 +170,9 @@ Remove-Item .\config.json.plain.bak   # 确认无误后删除明文备份
 | `CampusLogin_AutoStartup` | 登录后 15 秒首次；之后每 5 分钟重试一次，持续 2 小时 | 开机自动连；刚登录时 DHCP 没就绪也能随后补上 |
 | `CampusLogin_Daily0610` | 每天 06:10（唤醒计算机） | 防止会话过期 |
 
-任务动作是 `wscript.exe run_silent.vbs`（不经过 cmd.exe，因此不会有 0xc0000142 弹窗）。
+任务动作是 `wscript.exe run_silent.vbs`（不经过 cmd.exe，因此不会有 0xc0000142 弹窗）；
+`run_silent.vbs` 传给脚本的参数是 `--auto --quiet`，`--auto` 才会启用“每次开机最多自动启用一次”的
+保护逻辑——手动运行（`run_now.vbs` / `node campus_login.js`）不带该参数，始终允许启用网卡。
 
 ## 退出码
 
@@ -160,7 +180,7 @@ Remove-Item .\config.json.plain.bak   # 确认无误后删除明文备份
 | --- | --- |
 | `0` | 登录成功，或本来就已在线；也用于「已有实例在运行，本次跳过」 |
 | `1` | 登录失败（认证被拒 / 重试用尽 / 二次校验未通过） |
-| `2` | 网络未就绪（拿不到 172.10.x.x 或一直不可达），可稍后重试 |
+| `2` | 网络未就绪（拿不到 172.10.x.x 或一直不可达）；也用于「网卡被你手动禁用，自动任务尊重该选择并跳过」 |
 | `3` | 配置错误（缺字段、JSON 损坏、密码解密失败） |
 
 ## 常见问题
@@ -172,6 +192,11 @@ Remove-Item .\config.json.plain.bak   # 确认无误后删除明文备份
 **日志说「物理网卡未被禁用，但暂未获取到校园网 IP」**
 网卡是启用的但 DHCP 还没下发地址（常见于刚开机）。脚本会自动刷租约并继续等；
 若长期如此，检查网线 / 交换机端口，或跑 `node nic_ctl.js --diag` 看网卡与 IP 详情。
+
+**我手动禁用了网卡，为什么计划任务没有再自动启用它？**
+这是 v1.1.1 起的有意行为：每次开机自动任务只启用一次，之后尊重你的手动禁用（日志会写
+「尊重该选择」）。想立刻上网就双击 `run_now.vbs`；想恢复“每次都自动启用”就把 `config.json` 里的
+`autoEnable` 改成 `"always"`。
 
 **日志出现「已有另一个登录实例在运行，本次跳过」**
 说明上一次还在跑（或锁文件残留）。等几分钟重试；确认没有 node 进程时可删除

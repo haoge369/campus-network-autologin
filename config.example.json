@@ -4,6 +4,7 @@
   "serverHost": "172.10.110.252",
   "portalPort": 80,
   "manageAdapter": true,
+  "autoEnable": "once",
   "defaultQueryString": "wlanuserip=xxx&wlanacname=xxx&ssid=&nasip=xxx&snmpagentip=&mac=111111111&t=wireless-v2&url=xxx",
   "adapterMatch": "Realtek PCIe 2.5GbE",
   "nicEnableWaitMs": 60000,

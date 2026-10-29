@@ -1,5 +1,9 @@
 // 锐捷 eportal 校园网自动登录（Windows）
 //
+// v1.1.1 主要变化：自动任务不再反复拉起用户手动禁用的网卡。
+//   autoEnable: once（默认，每次开机最多自动启用一次）/ always（旧行为）/ never；
+//   手动运行（run_now.vbs / run.bat）始终允许启用网卡。
+//
 // v1.1.0 主要变化：
 //   1. 请求只绑定校园网网卡（172.10.x.x），修复历史 ENETUNREACH；
 //   2. queryString 从门户网关实时重定向抓取，1.1.1.1 只作为备选探测；
@@ -10,6 +14,7 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -17,7 +22,7 @@ const networkClient = require('./network_client');
 const { encryptPassword } = require('./rsa_util');
 const nicCtl = require('./nic_ctl');
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 const SCRIPT_DIR = __dirname;
 const CONFIG_PATH = process.env.CAMPUS_LOGIN_CONFIG
   ? path.resolve(process.env.CAMPUS_LOGIN_CONFIG)
@@ -26,6 +31,8 @@ const LOG_PATH = process.env.CAMPUS_LOGIN_LOG
   ? path.resolve(process.env.CAMPUS_LOGIN_LOG)
   : path.join(SCRIPT_DIR, 'campus_login.log');
 const LOCK_PATH = path.join(SCRIPT_DIR, 'campus_login.lock');
+// 记录“本次开机是否已经自动处理过网卡”，避免用户手动禁用后被自动任务反复拉起
+const STATE_PATH = path.join(SCRIPT_DIR, 'state.json');
 
 // 退出码：让计划任务/外部脚本能区分"登录失败"和"网络还没就绪"
 const EXIT = Object.freeze({
@@ -39,6 +46,9 @@ const DEFAULTS = Object.freeze({
   serverHost: '172.10.110.252',
   portalPort: 80,
   manageAdapter: true,
+  // 自动启用策略：once=每次开机最多自动启用一次网卡（默认，避免手动禁用被反复拉起）；
+  // always=只要检测到禁用就启用（旧行为）；never=从不自动启用（等价于 manageAdapter=false）。
+  autoEnable: 'once',
   probeUrls: [
     'http://1.1.1.1/',
     'http://connect.rom.miui.com/generate_204',
@@ -58,6 +68,8 @@ const DEFAULTS = Object.freeze({
   defaultQueryString: ''
 });
 
+const AUTO_ENABLE_MODES = Object.freeze(['once', 'always', 'never']);
+
 const NUMERIC_KEYS = [
   'portalPort',
   'nicEnableWaitMs',
@@ -71,6 +83,10 @@ const NUMERIC_KEYS = [
 ];
 
 let quietMode = process.env.CAMPUS_LOGIN_QUIET === '1';
+
+// 本次运行中，是否因为「尊重用户手动禁用的选择」而没有启用网卡。
+// 一旦置位，runLogin 会立即以 NETWORK_NOT_READY 退出，不再空转重试。
+let adapterDisabledByUser = false;
 
 // ---------------------------------------------------------------------------
 // 错误类型
@@ -159,6 +175,9 @@ function mergeConfig(raw = {}, defaults = DEFAULTS) {
     config.portalPort = defaults.portalPort;
   }
   config.manageAdapter = config.manageAdapter !== false;
+  if (!AUTO_ENABLE_MODES.includes(config.autoEnable)) {
+    config.autoEnable = defaults.autoEnable;
+  }
   return config;
 }
 
@@ -302,11 +321,12 @@ function releaseLock(lockPath = LOCK_PATH) {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv = []) {
-  const options = { force: false, quiet: false, status: false, help: false };
+  const options = { force: false, quiet: false, status: false, help: false, auto: false };
   for (const arg of argv) {
     if (arg === '--force' || arg === '-f') options.force = true;
     else if (arg === '--quiet' || arg === '-q' || arg === '/quiet') options.quiet = true;
     else if (arg === '--status' || arg === '-s') options.status = true;
+    else if (arg === '--auto') options.auto = true;
     else if (arg === '--help' || arg === '-h' || arg === '/?') options.help = true;
   }
   return options;
@@ -321,6 +341,8 @@ function printHelp() {
     '  --status, -s   只输出一行 JSON 状态（在线/离线、IP、网卡），不登录',
     '  --force,  -f   跳过在线检查，强制重新登录',
     '  --quiet,  -q   静默模式：不打印到控制台（日志照常写入）',
+    '  --auto         自动运行模式（计划任务使用）：每次开机最多自动启用一次网卡，',
+    '                 之后即使你手动禁用也不会再被拉起；手动运行不带该参数',
     '  --help,   -h   显示本帮助',
     '',
     '退出码: 0=成功/已在线  1=登录失败  2=网络未就绪  3=配置错误',
@@ -584,10 +606,106 @@ async function doLogin(config, queryString) {
   throw new AuthError(`登录失败: ${reason}`);
 }
 
+// ---------------------------------------------------------------------------
+// 自动启用策略：避免“用户手动禁用后被自动任务反复拉起”
+// ---------------------------------------------------------------------------
+
+/**
+ * 稳定标识当前这次开机：当前秒级时间戳 - 已开机秒数。
+ * 重启后结果必然变化，可用于判断 state.json 是否属于本次开机。
+ */
+function getBootId(nowMs = Date.now(), uptimeSec = os.uptime()) {
+  return String(Math.round(nowMs / 1000 - uptimeSec));
+}
+
+function loadState(statePath = STATE_PATH) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (raw && typeof raw === 'object') {
+      return {
+        bootId: typeof raw.bootId === 'string' ? raw.bootId : '',
+        bootHandledAt: Number.isFinite(raw.bootHandledAt) ? raw.bootHandledAt : 0,
+        enableCount: Number.isFinite(raw.enableCount) ? raw.enableCount : 0,
+        lastEnableAt: Number.isFinite(raw.lastEnableAt) ? raw.lastEnableAt : 0
+      };
+    }
+  } catch (err) {
+    // 文件不存在或损坏：按空状态处理
+  }
+  return { bootId: '', bootHandledAt: 0, enableCount: 0, lastEnableAt: 0 };
+}
+
+function saveState(state, statePath = STATE_PATH) {
+  try {
+    fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * 自动运行是否允许启用网卡（纯函数，便于单元测试）。
+ * @param {{interactive:boolean, mode:'once'|'always'|'never', adapterState:string, state:object, bootId:string}} input
+ * @returns {{allow:boolean, reason:string}}
+ */
+function shouldAutoEnable({ interactive, mode, adapterState, state, bootId }) {
+  if (mode === 'never') return { allow: false, reason: 'mode-never' };
+  if (interactive) return { allow: true, reason: 'manual-run' };
+  if (mode === 'always') return { allow: true, reason: 'mode-always' };
+  if (adapterState === 'enabled' || adapterState === 'unknown') {
+    return { allow: false, reason: 'already-enabled' };
+  }
+  if (adapterState === 'notfound') return { allow: false, reason: 'notfound' };
+  if (adapterState === 'error') return { allow: false, reason: 'state-error' };
+  const sameBoot = !!state && state.bootId === bootId;
+  if (sameBoot && state.bootHandledAt > 0) return { allow: false, reason: 'boot-handled' };
+  return { allow: true, reason: 'first-run-this-boot' };
+}
+
+/** 记录“本次开机已经处理过网卡”，本次开机内后续自动运行不再启用网卡。 */
+function markBootHandled(config, options = {}, statePath = STATE_PATH, extra = {}) {
+  if (options.interactive !== false) return false; // 手动运行不占用开机额度
+  if (config.autoEnable !== 'once') return false;
+  const bootId = getBootId();
+  const previous = loadState(statePath);
+  const sameBoot = previous.bootId === bootId;
+  saveState(
+    {
+      bootId,
+      bootHandledAt: Date.now(),
+      enableCount: (sameBoot ? previous.enableCount : 0) + (extra.enabled ? 1 : 0),
+      lastEnableAt: extra.enabled ? Date.now() : sameBoot ? previous.lastEnableAt : 0
+    },
+    statePath
+  );
+  return true;
+}
+
+function describeSkipReason(reason, config) {
+  switch (reason) {
+    case 'mode-never':
+      return 'config.autoEnable=never，不做网卡自愈（可改为 once 或 always）';
+    case 'boot-handled':
+      return '本次开机已经自动处理过网卡；检测到你现在禁用了它，尊重该选择（手动运行 run_now.vbs 仍会启用，下次开机恢复自动启用）';
+    case 'already-enabled':
+      return '网卡本身已处于启用状态，无需自动启用';
+    case 'notfound':
+      return `未找到匹配「${config.adapterMatch}」的物理网卡，请检查 config.json 中的 adapterMatch`;
+    case 'state-error':
+      return '无法确定网卡状态，为避免误操作本次不自动启用（可运行 node nic_ctl.js --diag 排查）';
+    default:
+      return reason;
+  }
+}
+
 /**
  * 步骤 0：确保物理网卡已启用，并等待校园网 IP 就绪。
+ * options.interactive=false 表示由计划任务（--auto）触发。
  */
-async function ensureCampusNetwork(config) {
+async function ensureCampusNetwork(config, options = {}) {
+  const interactive = options.interactive !== false;
+
   if (config.manageAdapter === false) {
     const current = networkClient.getCampusIp();
     log(current ? `manageAdapter=false，跳过网卡自愈检查（当前 IP: ${current}）` : 'manageAdapter=false，跳过网卡自愈检查（当前未获取到校园网 IP）');
@@ -597,28 +715,66 @@ async function ensureCampusNetwork(config) {
   let ip = networkClient.getCampusIp();
   if (ip) {
     log(`检测到校园网地址: ${ip}`);
+    markBootHandled(config, options);
     return ip;
   }
 
   log('未检测到校园网地址 (172.10.x.x)，检查物理网卡是否被禁用...');
 
+  // 先只查询状态，绝不直接启用：由 shouldAutoEnable 决定是否允许动网卡
+  const bootId = getBootId();
+  const state = loadState();
+  let adapterState = 'unknown';
   let adapterName = null;
   try {
-    const result = await nicCtl.ensureCampusAdapter(config.adapterMatch);
-    adapterName = result.adapter || null;
-    if (result.action === 'enabled') {
-      log(
-        `物理网卡「${result.adapter || config.adapterMatch}」原本处于禁用状态（方式: ${result.method}），已自动启用。`
-      );
-    } else if (result.action === 'already') {
-      log(`物理网卡「${result.adapter || config.adapterMatch}」已启用（状态: ${result.status}），但尚未获取到校园网 IP。`);
-    } else if (result.action === 'notfound') {
-      log(`未找到匹配「${config.adapterMatch}」的物理网卡，请检查 config.json 中的 adapterMatch。`);
-    } else if (result.action === 'error') {
-      log(`启用物理网卡失败: ${result.message || '未知错误'}（若当前不是管理员，请右键以管理员身份运行）。`);
+    const current = await nicCtl.getAdapterState(config.adapterMatch);
+    adapterState = current.state;
+    adapterName = current.adapter || null;
+    if (current.state === 'error') {
+      log(`查询网卡状态失败: ${current.message || '未知错误'}`);
     }
   } catch (err) {
-    log(`启用物理网卡时发生异常: ${err.message}`);
+    log(`查询网卡状态时发生异常: ${err.message}`);
+  }
+
+  const decision = shouldAutoEnable({
+    interactive,
+    mode: config.autoEnable,
+    adapterState,
+    state,
+    bootId
+  });
+
+  if (!decision.allow) {
+    log(`不自动启用网卡：${describeSkipReason(decision.reason, config)}`);
+    if (decision.reason === 'already-enabled') {
+      markBootHandled(config, options);
+    } else if (adapterState === 'disabled') {
+      log('网卡处于禁用状态且本次不自动启用，跳过等待 IP（需要立即上网请手动运行 run_now.vbs）。');
+      adapterDisabledByUser = true;
+      return null;
+    }
+  } else {
+    try {
+      const result = await nicCtl.ensureCampusAdapter(config.adapterMatch);
+      adapterName = result.adapter || adapterName;
+      if (result.action === 'enabled') {
+        log(
+          `物理网卡「${result.adapter || config.adapterMatch}」原本处于禁用状态（方式: ${result.method}），已自动启用。`
+        );
+      } else if (result.action === 'already') {
+        log(`物理网卡「${result.adapter || config.adapterMatch}」已启用（状态: ${result.status}），但尚未获取到校园网 IP。`);
+      } else if (result.action === 'notfound') {
+        log(`未找到匹配「${config.adapterMatch}」的物理网卡，请检查 config.json 中的 adapterMatch。`);
+      } else if (result.action === 'error') {
+        log(`启用物理网卡失败: ${result.message || '未知错误'}（若当前不是管理员，请右键以管理员身份运行）。`);
+      }
+      if (result.action === 'enabled' || result.action === 'already') {
+        markBootHandled(config, options, STATE_PATH, { enabled: result.action === 'enabled' });
+      }
+    } catch (err) {
+      log(`启用物理网卡时发生异常: ${err.message}`);
+    }
   }
 
   if (networkClient.getCampusIp()) {
@@ -676,7 +832,15 @@ async function waitForCampusIpWithRenew(adapterName, timeoutMs) {
 async function runLogin(config, options = {}) {
   log(`========== 校园网自动登录任务启动 (v${APP_VERSION}) ==========`);
 
-  await ensureCampusNetwork(config);
+  await ensureCampusNetwork(config, options);
+
+  // 用户手动禁用了网卡，而本次是计划任务（--auto）且开机额度已用过：
+  // 尊重用户选择，直接以「网络未就绪」退出，不做无意义的重试。
+  if (adapterDisabledByUser) {
+    log('网卡被用户禁用且本次不自动启用，跳过登录（需要立即上网请手动运行 run_now.vbs）。');
+    log('========== 校园网自动登录结束（网络未就绪） ==========');
+    return { code: EXIT.NETWORK_NOT_READY, reason: 'adapter-disabled-by-user' };
+  }
 
   if (!options.force) {
     const status = await checkIsOnline(config);
@@ -709,7 +873,7 @@ async function runLogin(config, options = {}) {
     try {
       if (!networkClient.getCampusIp()) {
         log('尚未获取到校园网 IP，先等待网卡/DHCP 就绪...');
-        await ensureCampusNetwork(config);
+        await ensureCampusNetwork(config, options);
       }
 
       const detected = await detectQueryString(config);
@@ -736,6 +900,7 @@ async function runLogin(config, options = {}) {
       const verified = await checkIsOnline(config);
       if (verified.online) {
         log('二次校验通过，当前设备已在线。');
+        markBootHandled(config, options);
         log('========== 校园网自动登录完成 ==========');
         return { code: EXIT.OK, reason: 'logged-in' };
       }
@@ -779,18 +944,29 @@ async function runLogin(config, options = {}) {
  */
 async function printStatus(config) {
   const iface = networkClient.getCampusInterface();
+  let adapter = null;
+  try {
+    adapter = await nicCtl.getAdapterState(config.adapterMatch);
+  } catch (err) {
+    adapter = null;
+  }
   const status = {
     version: APP_VERSION,
     time: formatTime(),
     serverHost: config.serverHost,
     adapterMatch: config.adapterMatch,
-    nic: iface
-      ? {
-          name: iface.name,
-          address: iface.address,
-          mac: networkClient.macToSalt(iface.mac) || null
-        }
-      : null,
+    autoEnable: config.autoEnable,
+    nic: {
+      name: (adapter && adapter.adapter) || (iface && iface.name) || null,
+      state: adapter ? adapter.state : 'unknown',
+      status: adapter ? adapter.status || null : null,
+      // 只有网卡身份与状态里的网卡一致时才展示地址，避免误显示虚拟网卡
+      address: iface && adapter && iface.name === adapter.adapter ? iface.address : null,
+      mac:
+        iface && adapter && iface.name === adapter.adapter
+          ? networkClient.macToSalt(iface.mac) || null
+          : null
+    },
     ip: networkClient.getCampusIp(),
     online: false,
     unreachable: false
@@ -807,6 +983,8 @@ async function printStatus(config) {
 
 async function main(argv = process.argv.slice(2), configPath = CONFIG_PATH) {
   const options = parseArgs(argv);
+  // --auto = 计划任务触发；不带该参数视为用户手动运行，允许主动启用网卡
+  options.interactive = !options.auto;
   quietMode = options.quiet || process.env.CAMPUS_LOGIN_QUIET === '1';
 
   if (options.help) {
@@ -854,33 +1032,41 @@ if (require.main === module) {
 
 module.exports = {
   APP_VERSION,
+  AUTO_ENABLE_MODES,
   CONFIG_PATH,
   DEFAULTS,
   EXIT,
   LOG_PATH,
   LOCK_PATH,
+  STATE_PATH,
   ConfigError,
   AuthError,
   acquireLock,
   classifyError,
   checkIsOnline,
   decryptDpapi,
+  describeSkipReason,
   detectQueryString,
   doLogin,
   ensureCampusNetwork,
   extractMacFromQueryString,
   formatTime,
+  getBootId,
   isPidAlive,
   isPortalQueryString,
   loadConfig,
+  loadState,
   log,
   main,
+  markBootHandled,
   mergeConfig,
   parseArgs,
   printStatus,
   releaseLock,
   rotateLogIfNeeded,
   runLogin,
+  saveState,
+  shouldAutoEnable,
   sleep,
   stripQueryString,
   waitForCampusIpWithRenew

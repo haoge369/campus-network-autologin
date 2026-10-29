@@ -27,4 +27,6 @@ Next
 If nodeExe = "" Then nodeExe = "node.exe"
 
 ' 0 = hidden window, False = do not wait (the task ends immediately)
-ws.Run """" & nodeExe & """ """ & scriptDir & "\campus_login.js""", 0, False
+' --auto: 计划任务模式——每次开机最多自动启用一次网卡，之后不再拉起用户手动禁用的网卡
+' --quiet: 不往控制台输出（日志照常写入 campus_login.log）
+ws.Run """" & nodeExe & """ """ & scriptDir & "\campus_login.js"" --auto --quiet", 0, False

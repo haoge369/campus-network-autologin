@@ -61,12 +61,20 @@ test('mergeConfig: 补默认值、规整数值、复制数组', () => {
 });
 
 test('parseArgs: 识别各命令行选项', () => {
-  assert.deepStrictEqual(cl.parseArgs([]), { force: false, quiet: false, status: false, help: false });
+  assert.deepStrictEqual(cl.parseArgs([]), {
+    force: false,
+    quiet: false,
+    status: false,
+    help: false,
+    auto: false
+  });
   const parsed = cl.parseArgs(['--force', '--status', '-q']);
   assert.strictEqual(parsed.force, true);
   assert.strictEqual(parsed.status, true);
   assert.strictEqual(parsed.quiet, true);
+  assert.strictEqual(parsed.auto, false);
   assert.strictEqual(cl.parseArgs(['-h']).help, true);
+  assert.strictEqual(cl.parseArgs(['--auto']).auto, true);
   assert.strictEqual(cl.parseArgs(['--unknown']).force, false);
 });
 

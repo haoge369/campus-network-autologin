@@ -25,7 +25,8 @@
 # which would garble non-ASCII adapter names such as the Chinese "Ethernet".
 param(
     [string]$MatchHint = 'Realtek PCIe 2.5GbE',
-    [switch]$Diag
+    [switch]$Diag,
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -145,6 +146,23 @@ try {
     $disabledByAdapter = ($adapter -ne $null) -and (
         ($adapter.Status -eq 'Disabled') -or ($adapter.AdminStatus -eq 'Down')
     )
+
+    # -CheckOnly: only report the state, never modify anything. campus_login.js
+    # uses this to decide whether an automatic run may re-enable the adapter
+    # (for example: the user disabled it on purpose after a successful login).
+    if ($CheckOnly) {
+        Write-TextValue 'ADAPTER' $adapterName
+        Write-TextValue 'ADAPTER_HINT' $hintDescription
+        Write-KeyValue 'STATUS' $statusBefore
+        if ($pnpTarget) { Write-KeyValue 'PNP_PROBLEM' ([string]$pnpTarget.Problem) }
+        Write-KeyValue 'METHOD' 'checkonly'
+        if ($disabledByPnp -or $disabledByAdapter) {
+            Write-KeyValue 'RESULT' 'disabled'
+        } else {
+            Write-KeyValue 'RESULT' 'enabled'
+        }
+        exit 0
+    }
 
     if (-not $disabledByPnp -and -not $disabledByAdapter) {
         Write-TextValue 'ADAPTER' $adapterName

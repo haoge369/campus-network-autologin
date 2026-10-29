@@ -1,5 +1,23 @@
 # 更新记录
 
+## v1.1.1 (2026-10-30)
+
+### 修复
+- **手动禁用的网卡被计划任务反复启用**：`CampusLogin_AutoStartup` 每 5 分钟重试一次，每次都会
+  调用网卡自愈，把用户刚手动禁用的网卡又启用。现在新增 `autoEnable` 策略（默认 `once`）：
+  每次开机最多自动启用一次，之后尊重用户的手动禁用选择；不再自动启用时直接以退出码 `2`
+  （网络未就绪）结束，不做无意义的登录重试。
+
+### 新增
+- 配置项 `autoEnable`：`once`（默认）/ `always`（旧行为）/ `never`。
+- 状态文件 `state.json`：记录 `bootId`、`bootHandledAt`、`enableCount`、`lastEnableAt`，
+  重启后自动失效。
+- 命令行参数 `--auto`（计划任务模式）；`run_silent.vbs` 改为传 `--auto --quiet`。
+- `enable_campus_nic.ps1 -CheckOnly` 与 `nic_ctl.getAdapterState()`：登录前只查询网卡状态，
+  不改动网卡。
+- `--status` 输出新增 `autoEnable` 与 `nic.state` / `nic.status` 字段。
+- 单元测试新增 `test/enable_guard.test.js`（13 个用例），测试总数 28 → 40。
+
 ## v1.1.0 (2026-10-29)
 
 ### 修复

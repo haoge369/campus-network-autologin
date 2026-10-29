@@ -160,6 +160,28 @@ async function runDiag(matchHint = DEFAULT_ADAPTER_MATCH) {
 }
 
 /**
+ * 只查询物理网卡当前状态，不做任何修改
+ * （自动任务再用它判断“是否允许自动启用”，避免用户手动禁用后被反复拉起）
+ * @returns {Promise<{state:'enabled'|'disabled'|'notfound'|'error', adapter?:string, status?:string, pnpProblem?:string, message?:string}>}
+ */
+async function getAdapterState(matchHint = DEFAULT_ADAPTER_MATCH) {
+  const kv = await runEnableScript(matchHint, PS_TIMEOUT_MS, ['-CheckOnly']);
+  const result = String(kv.RESULT || '').toLowerCase();
+  if (result === 'enabled' || result === 'disabled' || result === 'notfound') {
+    return {
+      state: result,
+      adapter: kv.ADAPTER || '',
+      status: kv.STATUS || '',
+      pnpProblem: kv.PNP_PROBLEM || ''
+    };
+  }
+  return {
+    state: 'error',
+    message: kv.MESSAGE || ('无法解析网卡状态: ' + JSON.stringify(kv))
+  };
+}
+
+/**
  * 刷新指定网卡的 DHCP 租约（ipconfig /renew "<网卡名>"）
  * @param {string} adapterName 网卡名称，例如 "以太网"
  * @param {number} timeoutMs 超时
@@ -234,6 +256,7 @@ module.exports = {
   DEFAULT_ADAPTER_MATCH,
   DEFAULT_WAIT_MS,
   ensureCampusAdapter,
+  getAdapterState,
   runDiag,
   renewAdapterDhcp,
   waitForCampusIp,
