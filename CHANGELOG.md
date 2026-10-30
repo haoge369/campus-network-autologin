@@ -1,5 +1,26 @@
 # 更新记录
 
+## v1.1.2 (2026-10-30)
+
+### 修复
+- **门户已在线时被误判为「登录失败」**：门户的 `getOnlineUserInfo` 有时返回
+  `{"userIndex":"..."}`（没有 `result` 字段），或者门户根路径直接 302 跳
+  `redirectortosuccess`；旧逻辑只认 `result === 'success'`，于是判定「未登录」，
+  接着抓不到实时参数、回落到过期的 `defaultQueryString`，`pageInfo` 返回空响应，
+  最终以退出码 1 报错（日志里「门户对 pageInfo 返回空响应」）。
+  现在在线判定放宽为三条信号任一命中：带 `userIndex` 的 JSON / `redirectortosuccess`
+  302 跳 `success.jsp` / 门户根路径 302 跳 `redirectortosuccess`；
+  并且在 `pageInfo` 空响应时复核在线状态，确认在线就按成功结束（退出码 0）。
+- 判定为离线时，日志会打印三条探测的 HTTP 状态码与响应字节数，方便下次直接定位。
+- **计划任务可能静默空转**：`run_silent.vbs` 之前以 UTF-8（无 BOM）保存，含中文注释时会被
+  WSH 按 ANSI 解析，部分环境下 `ws.Run` 不报错却根本没启动 node——计划任务显示
+  `LastTaskResult=0`，但日志里没有任何新记录。现改为 UTF-16LE（带 BOM）保存，与
+  `run_now.vbs` 一致，并已用 `Start-ScheduledTask` 实测确认日志正常写入。
+
+### 新增
+- `test/online_probe.test.js`：5 个在线判定用例（含非 JSON、全空、根路径跳转等）。
+- 假门户新增「已在线 + pageInfo 空响应」集成用例（复现本次故障场景，断言退出码 0）。
+
 ## v1.1.1 (2026-10-30)
 
 ### 修复

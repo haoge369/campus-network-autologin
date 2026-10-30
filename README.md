@@ -198,9 +198,25 @@ Remove-Item .\config.json.plain.bak   # 确认无误后删除明文备份
 「尊重该选择」）。想立刻上网就双击 `run_now.vbs`；想恢复“每次都自动启用”就把 `config.json` 里的
 `autoEnable` 改成 `"always"`。
 
+**日志报「门户对 pageInfo 返回空响应」，然后退出码 1**
+
+这是 v1.1.1 及更早版本的已知问题，v1.1.2 已修：门户其实已经在线（或会话还挂着）时，
+它不会再下发新的 `queryString`，旧逻辑却把「在线探测失败」当成「未登录」去登录，于是报错。
+现在判定在线会综合三条信号（`userIndex` JSON、`redirectortosuccess` 302、门户根路径 302），
+`pageInfo` 空响应时还会复核一次在线状态，确认在线就直接成功退出（退出码 0，不再弹错误框）。
+如果确实离线却仍报这个错，多半是 `defaultQueryString` 过期：把它清空（`""`），
+脚本会重新抓取实时参数。
+
 **日志出现「已有另一个登录实例在运行，本次跳过」**
 说明上一次还在跑（或锁文件残留）。等几分钟重试；确认没有 node 进程时可删除
 `campus_login.lock`。
+
+**计划任务显示运行成功（LastTaskResult=0），但日志里没有新记录**
+
+v1.1.1 及更早版本的 `run_silent.vbs` 是以 UTF-8（无 BOM）保存的，WSH 会按 ANSI 解析，
+个别环境下 `ws.Run` 不报错却没有启动 node，表现为「任务成功、什么也没发生」。v1.1.2 起
+已改为 UTF-16LE（带 BOM）保存。若你手工改过 `run_silent.vbs`，请务必用「UTF-16 LE with BOM」
+保存，否则可能又变成静默空转。
 
 **在哪里看历史记录？**
 `campus_login.log`（超过 1 MB 自动轮转为 `campus_login.log.1`，只保留一份历史）。
@@ -212,7 +228,7 @@ Remove-Item .\config.json.plain.bak   # 确认无误后删除明文备份
 
 ```powershell
 npm run check   # 语法检查
-npm test        # node:test 单元测试 + 假门户集成测试（零依赖，共 28 个用例）
+npm test        # node:test 单元测试 + 假门户集成测试（零依赖，共 46 个用例）
 npm run diag    # 网卡 / PnP / IP 诊断
 ```
 

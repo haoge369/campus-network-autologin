@@ -22,7 +22,7 @@ const networkClient = require('./network_client');
 const { encryptPassword } = require('./rsa_util');
 const nicCtl = require('./nic_ctl');
 
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 const SCRIPT_DIR = __dirname;
 const CONFIG_PATH = process.env.CAMPUS_LOGIN_CONFIG
   ? path.resolve(process.env.CAMPUS_LOGIN_CONFIG)
@@ -405,12 +405,51 @@ function extractMacFromQueryString(queryString) {
   return /^[0-9a-zA-Z:._-]{4,64}$/.test(value) ? value : null;
 }
 
+/**
+ * 纯函数：根据三条探测的响应判断当前是否已在线（不同门户版本字段不一致）。
+ *  1) getOnlineUserInfo 返回带 userIndex 的 JSON（不强制 result 字段）；
+ *  2) redirectortosuccess.jsp 302 跳 success.jsp；
+ *  3) 门户根路径 302 跳 redirectortosuccess（门户自己说「已登录」）。
+ */
+function interpretOnlineProbe(probe = {}) {
+  const gouiBody = probe.gouiBody || '';
+  const detail = {
+    gouiStatus: probe.gouiStatus || 0,
+    gouiLen: gouiBody.length,
+    rtsStatus: probe.rtsStatus || 0,
+    rootStatus: probe.rootStatus || 0
+  };
+
+  if (gouiBody) {
+    try {
+      const data = JSON.parse(gouiBody);
+      const userIndex = data.userIndex || data.user_index;
+      if (userIndex) return { online: true, userInfo: data, detail };
+    } catch (err) {
+      // 门户返回的可能不是 JSON，继续看重定向信号
+    }
+  }
+
+  const rtsOk =
+    probe.rtsStatus === 302 &&
+    typeof probe.rtsLocation === 'string' &&
+    probe.rtsLocation.includes('success.jsp');
+  const rootOk =
+    probe.rootStatus === 302 &&
+    typeof probe.rootLocation === 'string' &&
+    probe.rootLocation.includes('redirectortosuccess');
+  if (rtsOk || rootOk) return { online: true, detail };
+  return { online: false, detail };
+}
+
 async function checkIsOnline(config) {
   const common = {
     host: config.serverHost,
     port: config.portalPort,
     timeoutMs: config.requestTimeoutMs
   };
+
+  const probe = {};
   try {
     const res = await networkClient.request(
       {
@@ -421,38 +460,38 @@ async function checkIsOnline(config) {
       },
       'userIndex='
     );
+    probe.gouiStatus = res.statusCode;
+    probe.gouiBody = res.body || '';
+  } catch (err) {
+    return {
+      online: false,
+      unreachable: networkClient.isNetworkError(err),
+      error: err.message,
+      detail: { step: 'getOnlineUserInfo' }
+    };
+  }
 
-    if (res.body) {
-      try {
-        const data = JSON.parse(res.body);
-        if (data.result === 'success' && data.userIndex) {
-          return { online: true, userInfo: data };
-        }
-      } catch (err) {
-        // 返回可能不是 JSON
-      }
-    }
-
+  try {
     const redirect = await networkClient.request({
       ...common,
       path: '/eportal/redirectortosuccess.jsp',
       method: 'GET'
     });
-    if (
-      redirect.statusCode === 302 &&
-      redirect.headers.location &&
-      redirect.headers.location.includes('success.jsp')
-    ) {
-      return { online: true };
-    }
-    return { online: false, unreachable: false };
+    probe.rtsStatus = redirect.statusCode;
+    probe.rtsLocation = redirect.headers && redirect.headers.location;
   } catch (err) {
-    return {
-      online: false,
-      unreachable: networkClient.isNetworkError(err),
-      error: err.message
-    };
+    probe.rtsStatus = 0;
   }
+
+  try {
+    const root = await networkClient.request({ ...common, path: '/', method: 'GET' });
+    probe.rootStatus = root.statusCode;
+    probe.rootLocation = root.headers && root.headers.location;
+  } catch (err) {
+    probe.rootStatus = 0;
+  }
+
+  return interpretOnlineProbe(probe);
 }
 
 /**
@@ -538,7 +577,18 @@ async function fetchPageInfo(config, queryString) {
  * @returns {Promise<{ok:true, userIndex?:string, macSource:string}>}
  */
 async function doLogin(config, queryString) {
-  const pageInfo = await fetchPageInfo(config, queryString);
+  let pageInfo;
+  try {
+    pageInfo = await fetchPageInfo(config, queryString);
+  } catch (err) {
+    // pageInfo 空响应通常意味着门户已认为设备在线（不再下发新参数）。
+    // 先复核在线状态，确认在线就直接按成功处理，避免把「已在线」误报成登录失败。
+    if (err instanceof AuthError && /pageInfo 返回空响应/.test(err.message)) {
+      const current = await checkIsOnline(config);
+      if (current.online) return { ok: true, alreadyOnline: true, userIndex: null };
+    }
+    throw err;
+  }
 
   const exponent = pageInfo.publicKeyExponent || '10001';
   const modulus = pageInfo.publicKeyModulus;
@@ -851,6 +901,10 @@ async function runLogin(config, options = {}) {
     if (status.unreachable) {
       log(`在线状态检测失败（网络不可达: ${status.error || '未知'}），先不发起登录，等待链路恢复...`);
     } else {
+      const d = status.detail || {};
+      log(
+        `在线探测明细：getOnlineUserInfo=${d.gouiStatus || '-'}(${d.gouiLen || 0} 字节)，redirectortosuccess=${d.rtsStatus || '-'}，门户根路径=${d.rootStatus || '-'}`
+      );
       log('当前未登录，准备发起认证连接...');
     }
   } else {
@@ -894,6 +948,12 @@ async function runLogin(config, options = {}) {
       }
 
       const login = await doLogin(config, queryString);
+      if (login.alreadyOnline) {
+        log('门户已确认当前设备在线（pageInfo 未再下发参数），无需重复登录。');
+        markBootHandled(config, options);
+        log('========== 校园网自动登录完成 ==========');
+        return { code: EXIT.OK, reason: 'already-online' };
+      }
       log(`认证接口返回成功${login.userIndex ? `（userIndex: ${login.userIndex}）` : ''}，进行二次校验...`);
 
       await sleep(config.verifyAfterLoginMs);
@@ -1053,6 +1113,7 @@ module.exports = {
   formatTime,
   getBootId,
   isPidAlive,
+  interpretOnlineProbe,
   isPortalQueryString,
   loadConfig,
   loadState,

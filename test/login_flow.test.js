@@ -36,7 +36,8 @@ function startFakePortal(options = {}) {
     pageInfoBodies: [],
     loginSucceeds: options.loginSucceeds !== false,
     verifyStaysOffline: Boolean(options.verifyStaysOffline),
-    genericRedirect: Boolean(options.genericRedirect)
+    genericRedirect: Boolean(options.genericRedirect),
+    pageInfoEmpty: Boolean(options.pageInfoEmpty)
   };
 
   const server = http.createServer((req, res) => {
@@ -61,7 +62,7 @@ function startFakePortal(options = {}) {
         if (state.genericRedirect) {
           return redirect('http://go.microsoft.com/fwlink/?LinkID=219472&clcid=0x409');
         }
-        if (state.loggedIn) {
+        if (state.loggedIn && !state.verifyStaysOffline) {
           return redirect(`${base}/eportal/redirectortosuccess.jsp`);
         }
         return redirect(`${base}/eportal/index.jsp?${PORTAL_QUERY}`);
@@ -69,6 +70,11 @@ function startFakePortal(options = {}) {
 
       if (url.pathname === '/eportal/InterFace.do' && method === 'pageInfo') {
         state.pageInfoBodies.push(body);
+        if (state.loggedIn && state.pageInfoEmpty) {
+          // 真实门户在「已在线」时对 pageInfo 返回空响应（不再下发公钥参数）
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=UTF-8' });
+          return res.end('');
+        }
         return json({ publicKeyExponent: EXPONENT, publicKeyModulus: MODULUS });
       }
 
@@ -191,6 +197,24 @@ test('假门户：抓不到实时参数时回落到 defaultQueryString 并登录
     const result = await cl.runLogin(config, { force: true });
     assert.strictEqual(result.code, cl.EXIT.OK);
     assert.strictEqual(portal.state.loginBodies.length, 1);
+  } finally {
+    portal.server.close();
+  }
+});
+
+test('假门户：门户已在线导致 pageInfo 空响应 → 复核在线后按成功处理（退出码 0）', async () => {
+  const portal = await startFakePortal({ pageInfoEmpty: true });
+  try {
+    // 造出「一开始被判离线、真登录时门户却已在线」的现场：
+    // 先登录一次把假门户置为已在线，再用 --force 走完整流程。
+    portal.state.loggedIn = true;
+    const config = configFor(portal.port, { defaultQueryString: 'wlanuserip=1&mac=aaaa' });
+    const result = await cl.runLogin(config, { force: true });
+    assert.strictEqual(result.code, cl.EXIT.OK);
+    assert.strictEqual(result.reason, 'already-online');
+    // 空 pageInfo 说明确实走到了「已在线」这条补偿分支，而不是正常登录
+    assert.strictEqual(portal.state.pageInfoBodies.length, 1);
+    assert.strictEqual(portal.state.loginBodies.length, 0);
   } finally {
     portal.server.close();
   }

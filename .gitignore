@@ -27,3 +27,6 @@ node_modules/
 push_to_github.bat
 
 *.zip
+
+# 编辑器/工具临时目录（可能含明文配置快照）
+*.tmpdir/
