@@ -1,6 +1,6 @@
 {
   "name": "campus-network-autologin",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "private": true,
   "description": "锐捷 eportal 校园网自动登录（Windows，零依赖，含网卡禁用自愈与免 cmd.exe 启动器）",
   "main": "campus_login.js",

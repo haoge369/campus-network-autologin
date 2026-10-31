@@ -8,7 +8,7 @@ const path = require('node:path');
 
 const login = require('../campus_login');
 
-const BOOT = login.getBootId();
+const BOOT = login.getBootMarker();
 const state = (over = {}) => ({ bootId: BOOT, bootHandledAt: 0, enableCount: 0, lastEnableAt: 0, ...over });
 
 const decide = (over = {}) =>

@@ -22,7 +22,7 @@ const networkClient = require('./network_client');
 const { encryptPassword } = require('./rsa_util');
 const nicCtl = require('./nic_ctl');
 
-const APP_VERSION = '1.1.2';
+const APP_VERSION = '1.1.3';
 const SCRIPT_DIR = __dirname;
 const CONFIG_PATH = process.env.CAMPUS_LOGIN_CONFIG
   ? path.resolve(process.env.CAMPUS_LOGIN_CONFIG)
@@ -32,7 +32,9 @@ const LOG_PATH = process.env.CAMPUS_LOGIN_LOG
   : path.join(SCRIPT_DIR, 'campus_login.log');
 const LOCK_PATH = path.join(SCRIPT_DIR, 'campus_login.lock');
 // 记录“本次开机是否已经自动处理过网卡”，避免用户手动禁用后被自动任务反复拉起
-const STATE_PATH = path.join(SCRIPT_DIR, 'state.json');
+const STATE_PATH = process.env.CAMPUS_LOGIN_STATE
+  ? path.resolve(process.env.CAMPUS_LOGIN_STATE)
+  : path.join(SCRIPT_DIR, 'state.json');
 
 // 退出码：让计划任务/外部脚本能区分"登录失败"和"网络还没就绪"
 const EXIT = Object.freeze({
@@ -49,10 +51,18 @@ const DEFAULTS = Object.freeze({
   // 自动启用策略：once=每次开机最多自动启用一次网卡（默认，避免手动禁用被反复拉起）；
   // always=只要检测到禁用就启用（旧行为）；never=从不自动启用（等价于 manageAdapter=false）。
   autoEnable: 'once',
+  // 每次开机只自动执行一次登录：计划任务重复触发/补触发时直接跳过，
+  // 保证“开机后自动登录一次”，之后不再拉起用户手动禁用的网卡。
+  oncePerBoot: true,
   probeUrls: [
     'http://1.1.1.1/',
     'http://connect.rom.miui.com/generate_204',
     'http://www.msftconnecttest.com/redirect'
+  ],
+  // 真实外网可达性探测：门户说“在线”不等于真能上网，用于防止误报成功。
+  internetProbes: [
+    { url: 'http://www.msftconnecttest.com/connecttest.txt', contains: 'Microsoft Connect Test' },
+    { url: 'http://connectivitycheck.gstatic.com/generate_204', statusCode: 204 }
   ],
   adapterMatch: nicCtl.DEFAULT_ADAPTER_MATCH,
   nicEnableWaitMs: 60000,
@@ -166,6 +176,10 @@ function mergeConfig(raw = {}, defaults = DEFAULTS) {
     Array.isArray(config.probeUrls) && config.probeUrls.length > 0
       ? config.probeUrls.slice()
       : defaults.probeUrls.slice();
+  config.internetProbes =
+    Array.isArray(config.internetProbes) && config.internetProbes.length > 0
+      ? config.internetProbes.map((item) => (typeof item === 'string' ? { url: item } : { ...item }))
+      : defaults.internetProbes.map((item) => ({ ...item }));
   for (const key of NUMERIC_KEYS) {
     const value = Number(config[key]);
     config[key] = Number.isFinite(value) && value > 0 ? value : defaults[key];
@@ -321,12 +335,13 @@ function releaseLock(lockPath = LOCK_PATH) {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv = []) {
-  const options = { force: false, quiet: false, status: false, help: false, auto: false };
+  const options = { force: false, quiet: false, status: false, help: false, auto: false, daily: false };
   for (const arg of argv) {
     if (arg === '--force' || arg === '-f') options.force = true;
     else if (arg === '--quiet' || arg === '-q' || arg === '/quiet') options.quiet = true;
     else if (arg === '--status' || arg === '-s') options.status = true;
     else if (arg === '--auto') options.auto = true;
+    else if (arg === '--daily') options.daily = true;
     else if (arg === '--help' || arg === '-h' || arg === '/?') options.help = true;
   }
   return options;
@@ -343,6 +358,8 @@ function printHelp() {
     '  --quiet,  -q   静默模式：不打印到控制台（日志照常写入）',
     '  --auto         自动运行模式（计划任务使用）：每次开机最多自动启用一次网卡，',
     '                 之后即使你手动禁用也不会再被拉起；手动运行不带该参数',
+    '  --daily        每日 06:10 计划任务模式：同样尊重手动禁用，但不受',
+    '                 “每次开机只自动登录一次”限制（用于会话过期后的每日确认）',
     '  --help,   -h   显示本帮助',
     '',
     '退出码: 0=成功/已在线  1=登录失败  2=网络未就绪  3=配置错误',
@@ -663,9 +680,53 @@ async function doLogin(config, queryString) {
 /**
  * 稳定标识当前这次开机：当前秒级时间戳 - 已开机秒数。
  * 重启后结果必然变化，可用于判断 state.json 是否属于本次开机。
+ *
+ * 注意：Windows 的「快速启动」（HiberbootEnabled=1）属于混合休眠+恢复，
+ * 不会重置系统运行时长（os.uptime），也不会更新 LastBootUpTime，因此这个
+ * 公式在快速启动的机器上无法识别“新一次开机”。真正可用的开机标识是
+ * 系统日志里 Kernel-Boot 事件 27（bootmgr 每次启动都会写，包括快速启动）。
  */
 function getBootId(nowMs = Date.now(), uptimeSec = os.uptime()) {
   return String(Math.round(nowMs / 1000 - uptimeSec));
+}
+
+let cachedBootMarker = null;
+
+/**
+ * 本次开机的标识。优先用 Kernel-Boot 事件 27 的时间戳（快速启动也能识别），
+ * 读不到系统日志时退化为 getBootId() 的旧算法。
+ */
+function getBootMarker() {
+  if (cachedBootMarker) return cachedBootMarker;
+  if (process.env.CAMPUS_LOGIN_BOOT_ID) {
+    cachedBootMarker = String(process.env.CAMPUS_LOGIN_BOOT_ID);
+    return cachedBootMarker;
+  }
+
+  const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+  const powershell = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const script =
+    "$e=Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-Kernel-Boot';Id=27} " +
+    '-MaxEvents 1 -ErrorAction SilentlyContinue; ' +
+    'if($e){[string]$e.TimeCreated.ToUniversalTime().Ticks}';
+  try {
+    if (fs.existsSync(powershell)) {
+      const result = spawnSync(
+        powershell,
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        { encoding: 'utf8', timeout: 8000, windowsHide: true }
+      );
+      const ticks = String(result.stdout || '').trim();
+      if (/^\d{10,}$/.test(ticks)) {
+        cachedBootMarker = `kb:${ticks}`;
+        return cachedBootMarker;
+      }
+    }
+  } catch (err) {
+    // 读不到系统日志（权限/策略限制）：退化为旧算法
+  }
+  cachedBootMarker = `uptime:${getBootId()}`;
+  return cachedBootMarker;
 }
 
 function loadState(statePath = STATE_PATH) {
@@ -717,7 +778,7 @@ function shouldAutoEnable({ interactive, mode, adapterState, state, bootId }) {
 function markBootHandled(config, options = {}, statePath = STATE_PATH, extra = {}) {
   if (options.interactive !== false) return false; // 手动运行不占用开机额度
   if (config.autoEnable !== 'once') return false;
-  const bootId = getBootId();
+  const bootId = getBootMarker();
   const previous = loadState(statePath);
   const sameBoot = previous.bootId === bootId;
   saveState(
@@ -772,7 +833,7 @@ async function ensureCampusNetwork(config, options = {}) {
   log('未检测到校园网地址 (172.10.x.x)，检查物理网卡是否被禁用...');
 
   // 先只查询状态，绝不直接启用：由 shouldAutoEnable 决定是否允许动网卡
-  const bootId = getBootId();
+  const bootId = getBootMarker();
   const state = loadState();
   let adapterState = 'unknown';
   let adapterName = null;
@@ -882,6 +943,17 @@ async function waitForCampusIpWithRenew(adapterName, timeoutMs) {
 async function runLogin(config, options = {}) {
   log(`========== 校园网自动登录任务启动 (v${APP_VERSION}) ==========`);
 
+  // 「每次开机只执行一次」：计划任务触发的自动模式，本次开机已经跑过就直接退出，
+  // 避免重复触发把用户手动禁用的网卡重新拉起。
+  // 例外：--daily（每天 06:10 的会话确认）不受“每次开机只跑一次”限制。
+  if (options.interactive === false && !options.daily && config.oncePerBoot) {
+    if (bootAutoRunHandled()) {
+      log('本次开机已经自动执行过登录，跳过本次触发（每次开机只自动执行一次）。');
+      return { code: EXIT.OK, reason: 'already-run-this-boot' };
+    }
+    markBootRun();
+  }
+
   await ensureCampusNetwork(config, options);
 
   // 用户手动禁用了网卡，而本次是计划任务（--auto）且开机额度已用过：
@@ -895,8 +967,12 @@ async function runLogin(config, options = {}) {
   if (!options.force) {
     const status = await checkIsOnline(config);
     if (status.online) {
-      log('当前设备已处于在线登录状态，无需重复登录。');
-      return { code: EXIT.OK, reason: 'already-online' };
+      const internet = await checkInternetAccess(config);
+      if (internet.ok) {
+        log(`当前设备已处于在线登录状态，且外网可达（${internet.detail}），无需重复登录。`);
+        return { code: EXIT.OK, reason: 'already-online' };
+      }
+      log(`门户报告已在线，但外网不可达（${internet.detail}）——可能并未真正通过认证，继续尝试认证登录...`);
     }
     if (status.unreachable) {
       log(`在线状态检测失败（网络不可达: ${status.error || '未知'}），先不发起登录，等待链路恢复...`);
@@ -949,7 +1025,12 @@ async function runLogin(config, options = {}) {
 
       const login = await doLogin(config, queryString);
       if (login.alreadyOnline) {
-        log('门户已确认当前设备在线（pageInfo 未再下发参数），无需重复登录。');
+        const internet = await checkInternetAccess(config);
+        if (!internet.ok) {
+          log(`门户认为已在线，但外网不可达（${internet.detail}），判定为未真正联网。`);
+          return { code: EXIT.NETWORK_NOT_READY, reason: 'not-really-online' };
+        }
+        log(`门户已确认当前设备在线，且外网可达（${internet.detail}），无需重复登录。`);
         markBootHandled(config, options);
         log('========== 校园网自动登录完成 ==========');
         return { code: EXIT.OK, reason: 'already-online' };
@@ -959,13 +1040,19 @@ async function runLogin(config, options = {}) {
       await sleep(config.verifyAfterLoginMs);
       const verified = await checkIsOnline(config);
       if (verified.online) {
-        log('二次校验通过，当前设备已在线。');
-        markBootHandled(config, options);
-        log('========== 校园网自动登录完成 ==========');
-        return { code: EXIT.OK, reason: 'logged-in' };
+        const internet = await checkInternetAccess(config);
+        if (internet.ok) {
+          log(`二次校验通过，当前设备已在线且外网可达（${internet.detail}）。`);
+          markBootHandled(config, options);
+          log('========== 校园网自动登录完成 ==========');
+          return { code: EXIT.OK, reason: 'logged-in' };
+        }
+        lastError = new Error(`门户显示已在线，但外网不可达（${internet.detail}）`);
+        log(`${lastError.message}，本次不算登录成功，继续重试...`);
+      } else {
+        lastError = new Error('登录接口返回成功，但二次校验未在线（会话可能未建立）');
+        log(`${lastError.message}，继续重试...`);
       }
-      lastError = new Error('登录接口返回成功，但二次校验未在线（会话可能未建立）');
-      log(`${lastError.message}，继续重试...`);
     } catch (err) {
       lastError = err;
       const kind = classifyError(err);
@@ -997,6 +1084,69 @@ async function runLogin(config, options = {}) {
     code: networkFailures >= maxRetries ? EXIT.NETWORK_NOT_READY : EXIT.LOGIN_FAILED,
     reason: 'retry-exhausted'
   };
+}
+
+/**
+ * 本次开机是否已经执行过自动登录（“每次开机只跑一次”）。
+ */
+function bootAutoRunHandled(statePath = STATE_PATH) {
+  const state = loadState(statePath);
+  return state.bootId === getBootMarker() && state.bootHandledAt > 0;
+}
+
+/**
+ * 占用本次开机的自动执行额度（重复触发直接跳过）。
+ */
+function markBootRun(statePath = STATE_PATH) {
+  const bootId = getBootMarker();
+  const previous = loadState(statePath);
+  const sameBoot = previous.bootId === bootId;
+  saveState(
+    {
+      bootId,
+      bootHandledAt: Date.now(),
+      enableCount: sameBoot ? previous.enableCount : 0,
+      lastEnableAt: sameBoot ? previous.lastEnableAt : 0
+    },
+    statePath
+  );
+  return true;
+}
+
+/**
+ * 真实外网可达性校验：门户说“在线”不代表真能上网，避免误报“连接成功”。
+ * 返回 { ok, detail }；未配置探测地址时视为通过（兼容测试/离线环境）。
+ */
+async function checkInternetAccess(config) {
+  const probes = Array.isArray(config.internetProbes) ? config.internetProbes : [];
+  if (probes.length === 0) return { ok: true, detail: '未配置外网探测地址，跳过校验' };
+  const failures = [];
+  for (const probe of probes) {
+    const target = typeof probe === 'string' ? { url: probe } : probe || {};
+    if (!target.url) continue;
+    try {
+      const res = await networkClient.requestUrl(target.url, {
+        timeoutMs: Math.min(config.requestTimeoutMs || 5000, 5000)
+      });
+      const status = res.statusCode;
+      const body = res.body || '';
+      if (target.statusCode) {
+        if (status === target.statusCode) return { ok: true, detail: `${target.url} → HTTP ${status}` };
+        failures.push(`${target.url} → HTTP ${status}（期望 ${target.statusCode}）`);
+        continue;
+      }
+      const expected = target.contains || 'Microsoft Connect Test';
+      if (status === 200 && body.includes(expected)) {
+        return { ok: true, detail: `${target.url} → HTTP 200 且内容正常` };
+      }
+      failures.push(
+        `${target.url} → HTTP ${status}${body ? '（返回内容不是预期页面，可能被门户劫持）' : ''}`
+      );
+    } catch (err) {
+      failures.push(`${target.url} → ${err.code || err.message}`);
+    }
+  }
+  return { ok: false, detail: failures.join('；') || '所有探测地址均失败' };
 }
 
 /**
@@ -1037,14 +1187,23 @@ async function printStatus(config) {
   status.unreachable = !!statusResult.unreachable;
   if (statusResult.error) status.error = statusResult.error;
 
+  if (status.online) {
+    const internet = await checkInternetAccess(config);
+    status.internet = !!internet.ok;
+    if (!internet.ok) status.internetDetail = internet.detail;
+  } else {
+    status.internet = false;
+  }
+
   console.log(JSON.stringify(status));
-  return status.online ? EXIT.OK : EXIT.LOGIN_FAILED;
+  return status.online && status.internet ? EXIT.OK : EXIT.LOGIN_FAILED;
 }
 
 async function main(argv = process.argv.slice(2), configPath = CONFIG_PATH) {
   const options = parseArgs(argv);
-  // --auto = 计划任务触发；不带该参数视为用户手动运行，允许主动启用网卡
-  options.interactive = !options.auto;
+  // --auto = 计划任务触发；--daily = 每日 06:10 任务（同样不算“手动运行”）。
+  // 两者都不允许绕过网卡手动禁用的保护；不带这两个参数视为用户手动运行，允许主动启用网卡。
+  options.interactive = !options.auto && !options.daily;
   quietMode = options.quiet || process.env.CAMPUS_LOGIN_QUIET === '1';
 
   if (options.help) {
@@ -1102,6 +1261,8 @@ module.exports = {
   ConfigError,
   AuthError,
   acquireLock,
+  bootAutoRunHandled,
+  checkInternetAccess,
   classifyError,
   checkIsOnline,
   decryptDpapi,
@@ -1112,6 +1273,7 @@ module.exports = {
   extractMacFromQueryString,
   formatTime,
   getBootId,
+  getBootMarker,
   isPidAlive,
   interpretOnlineProbe,
   isPortalQueryString,
@@ -1120,6 +1282,7 @@ module.exports = {
   log,
   main,
   markBootHandled,
+  markBootRun,
   mergeConfig,
   parseArgs,
   printStatus,

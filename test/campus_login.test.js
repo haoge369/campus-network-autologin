@@ -66,15 +66,18 @@ test('parseArgs: 识别各命令行选项', () => {
     quiet: false,
     status: false,
     help: false,
-    auto: false
+    auto: false,
+    daily: false
   });
   const parsed = cl.parseArgs(['--force', '--status', '-q']);
   assert.strictEqual(parsed.force, true);
   assert.strictEqual(parsed.status, true);
   assert.strictEqual(parsed.quiet, true);
   assert.strictEqual(parsed.auto, false);
+  assert.strictEqual(parsed.daily, false);
   assert.strictEqual(cl.parseArgs(['-h']).help, true);
   assert.strictEqual(cl.parseArgs(['--auto']).auto, true);
+  assert.strictEqual(cl.parseArgs(['--daily']).daily, true);
   assert.strictEqual(cl.parseArgs(['--unknown']).force, false);
 });
 
