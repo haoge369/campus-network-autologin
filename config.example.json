@@ -14,7 +14,7 @@
   "authFailureDelayMs": 3000,
   "requestTimeoutMs": 5000,
   "verifyAfterLoginMs": 1500,
-  "internetRetryCount": 6,
+  "internetRetryCount": 8,
   "internetRetryDelayMs": 15000,
   "probeUrls": [
     "http://1.1.1.1/",

@@ -22,7 +22,7 @@ const networkClient = require('./network_client');
 const { encryptPassword } = require('./rsa_util');
 const nicCtl = require('./nic_ctl');
 
-const APP_VERSION = '1.1.4';
+const APP_VERSION = '1.1.5';
 const SCRIPT_DIR = __dirname;
 const CONFIG_PATH = process.env.CAMPUS_LOGIN_CONFIG
   ? path.resolve(process.env.CAMPUS_LOGIN_CONFIG)
@@ -74,7 +74,7 @@ const DEFAULTS = Object.freeze({
   // 门户“假在线”（门户说在线但外网被拦截）时的复查策略：
   // 每次等待 internetRetryDelayMs 后再复查，最多复查 internetRetryCount 次。
   // 校园网开机后网关放行常需要几十秒，等一会儿通常会自动恢复。
-  internetRetryCount: 6,
+  internetRetryCount: 8,
   internetRetryDelayMs: 15000,
   logMaxBytes: 1024 * 1024,
   lockStaleMs: 5 * 60 * 1000,
@@ -1275,7 +1275,10 @@ async function recoverFromStalePortalSession(config, status, options = {}) {
   }
   await sleep(Math.min(1500, Math.max(200, Number(config.internetRetryDelayMs) || 15000)));
 
-  const attempts = Math.max(1, Number(config.internetRetryCount) || 6);
+  // 计划任务（--auto/--daily）在开机时更耐心：默认最多等约 3 分钟；
+  // 手动运行按配置值（默认 8 × 15 秒 ≈ 2 分钟），避免双击后等太久。
+  const configured = Math.max(1, Number(config.internetRetryCount) || 8);
+  const attempts = options.interactive === false ? Math.max(configured, 12) : configured;
   const intervalMs = Math.max(200, Number(config.internetRetryDelayMs) || 15000);
   for (let i = 1; i <= attempts; i += 1) {
     const online = await checkIsOnline(config);
