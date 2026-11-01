@@ -14,6 +14,8 @@
   "authFailureDelayMs": 3000,
   "requestTimeoutMs": 5000,
   "verifyAfterLoginMs": 1500,
+  "internetRetryCount": 6,
+  "internetRetryDelayMs": 15000,
   "probeUrls": [
     "http://1.1.1.1/",
     "http://connect.rom.miui.com/generate_204",

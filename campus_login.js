@@ -22,7 +22,7 @@ const networkClient = require('./network_client');
 const { encryptPassword } = require('./rsa_util');
 const nicCtl = require('./nic_ctl');
 
-const APP_VERSION = '1.1.3';
+const APP_VERSION = '1.1.4';
 const SCRIPT_DIR = __dirname;
 const CONFIG_PATH = process.env.CAMPUS_LOGIN_CONFIG
   ? path.resolve(process.env.CAMPUS_LOGIN_CONFIG)
@@ -71,6 +71,11 @@ const DEFAULTS = Object.freeze({
   authFailureDelayMs: 3000,
   requestTimeoutMs: 5000,
   verifyAfterLoginMs: 1500,
+  // 门户“假在线”（门户说在线但外网被拦截）时的复查策略：
+  // 每次等待 internetRetryDelayMs 后再复查，最多复查 internetRetryCount 次。
+  // 校园网开机后网关放行常需要几十秒，等一会儿通常会自动恢复。
+  internetRetryCount: 6,
+  internetRetryDelayMs: 15000,
   logMaxBytes: 1024 * 1024,
   lockStaleMs: 5 * 60 * 1000,
   service: '',
@@ -88,6 +93,8 @@ const NUMERIC_KEYS = [
   'authFailureDelayMs',
   'requestTimeoutMs',
   'verifyAfterLoginMs',
+  'internetRetryCount',
+  'internetRetryDelayMs',
   'logMaxBytes',
   'lockStaleMs'
 ];
@@ -972,7 +979,18 @@ async function runLogin(config, options = {}) {
         log(`当前设备已处于在线登录状态，且外网可达（${internet.detail}），无需重复登录。`);
         return { code: EXIT.OK, reason: 'already-online' };
       }
-      log(`门户报告已在线，但外网不可达（${internet.detail}）——可能并未真正通过认证，继续尝试认证登录...`);
+      // 门户假在线（数据面被拦截）在校园网刚开机时很常见：先注销/等待，再决定是重登还是退出。
+      log(
+        `门户报告已在线，但外网不可达（${internet.detail}）——可能是认证网关尚未放行或会话残留，先等待并复查...`
+      );
+      await recoverFromStalePortalSession(config, status, options);
+      if (staleSessionRecovered) {
+        log('========== 校园网自动登录完成（等待后外网已恢复） ==========');
+        return { code: EXIT.OK, reason: 'already-online-recovered' };
+      }
+      if (!staleSessionNeedsRelogin) {
+        return { code: EXIT.NETWORK_NOT_READY, reason: 'portal-stale-session' };
+      }
     }
     if (status.unreachable) {
       log(`在线状态检测失败（网络不可达: ${status.error || '未知'}），先不发起登录，等待链路恢复...`);
@@ -987,19 +1005,34 @@ async function runLogin(config, options = {}) {
     log('已指定 --force 参数，跳过在线检查，强制发起认证登录...');
     const preStatus = await checkIsOnline(config);
     if (preStatus.online) {
-      log('注意：当前已经在线，门户不会再下发新的 queryString，--force 重登通常会失败；需要重连请先断网（或注销）再运行。');
+      const preInternet = await checkInternetAccess(config);
+      if (!preInternet.ok) {
+        log(`--force 前检测到门户在线但外网不可达（${preInternet.detail}），先尝试注销/等待恢复...`);
+        await recoverFromStalePortalSession(config, preStatus, options);
+        if (staleSessionRecovered) {
+          log('========== 校园网自动登录完成（等待后外网已恢复） ==========');
+          return { code: EXIT.OK, reason: 'already-online-recovered' };
+        }
+      } else {
+        log(
+          '注意：当前已经在线且外网可达，门户不会再下发新的 queryString，--force 重登通常会失败；需要重连请先断网（或注销）再运行。'
+        );
+      }
     }
   }
 
   const maxRetries = config.retryCount;
   let networkFailures = 0;
   let lastError = null;
+  // 本次尝试是否属于「门户说在线但外网被拦截」这种瞬时状态（按网络类失败退避重试）
+  let transientNoInternet = false;
   // 重试时门户可能已认为「在线」而不再 302 到实时参数页，此时复用本次运行中
   // 上一次成功抓到的 queryString，避免误判成配置错误。
   let lastQueryString = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
     log(`开始第 ${attempt}/${maxRetries} 次登录尝试...`);
+    transientNoInternet = false;
     try {
       if (!networkClient.getCampusIp()) {
         log('尚未获取到校园网 IP，先等待网卡/DHCP 就绪...');
@@ -1025,33 +1058,52 @@ async function runLogin(config, options = {}) {
 
       const login = await doLogin(config, queryString);
       if (login.alreadyOnline) {
-        const internet = await checkInternetAccess(config);
+        // 门户认为已在线，确认外网是否真的可通；刚开机时网关可能还没放行，等一小会儿再判定。
+        let internet = await checkInternetAccess(config);
         if (!internet.ok) {
-          log(`门户认为已在线，但外网不可达（${internet.detail}），判定为未真正联网。`);
-          return { code: EXIT.NETWORK_NOT_READY, reason: 'not-really-online' };
+          internet = await waitForInternetRecovery(config, {
+            attempts: 2,
+            intervalMs: config.internetRetryDelayMs
+          });
         }
-        log(`门户已确认当前设备在线，且外网可达（${internet.detail}），无需重复登录。`);
-        markBootHandled(config, options);
-        log('========== 校园网自动登录完成 ==========');
-        return { code: EXIT.OK, reason: 'already-online' };
-      }
-      log(`认证接口返回成功${login.userIndex ? `（userIndex: ${login.userIndex}）` : ''}，进行二次校验...`);
-
-      await sleep(config.verifyAfterLoginMs);
-      const verified = await checkIsOnline(config);
-      if (verified.online) {
-        const internet = await checkInternetAccess(config);
-        if (internet.ok) {
-          log(`二次校验通过，当前设备已在线且外网可达（${internet.detail}）。`);
+        if (!internet.ok) {
+          lastError = new Error(`门户认为已在线，但外网不可达（${internet.detail}）`);
+          networkFailures += 1;
+          transientNoInternet = true;
+          log(`${lastError.message}，判定为未真正联网，稍后重试...`);
+        } else {
+          log(`门户已确认当前设备在线，且外网可达（${internet.detail}），无需重复登录。`);
           markBootHandled(config, options);
           log('========== 校园网自动登录完成 ==========');
-          return { code: EXIT.OK, reason: 'logged-in' };
+          return { code: EXIT.OK, reason: 'already-online' };
         }
-        lastError = new Error(`门户显示已在线，但外网不可达（${internet.detail}）`);
-        log(`${lastError.message}，本次不算登录成功，继续重试...`);
       } else {
-        lastError = new Error('登录接口返回成功，但二次校验未在线（会话可能未建立）');
-        log(`${lastError.message}，继续重试...`);
+        log(`认证接口返回成功${login.userIndex ? `（userIndex: ${login.userIndex}）` : ''}，进行二次校验...`);
+
+        await sleep(config.verifyAfterLoginMs);
+        const verified = await checkIsOnline(config);
+        if (verified.online) {
+          let internet = await checkInternetAccess(config);
+          if (!internet.ok) {
+            internet = await waitForInternetRecovery(config, {
+              attempts: 2,
+              intervalMs: config.internetRetryDelayMs
+            });
+          }
+          if (internet.ok) {
+            log(`二次校验通过，当前设备已在线且外网可达（${internet.detail}）。`);
+            markBootHandled(config, options);
+            log('========== 校园网自动登录完成 ==========');
+            return { code: EXIT.OK, reason: 'logged-in' };
+          }
+          lastError = new Error(`门户显示已在线，但外网不可达（${internet.detail}）`);
+          networkFailures += 1;
+          transientNoInternet = true;
+          log(`${lastError.message}，本次不算登录成功，稍后重试...`);
+        } else {
+          lastError = new Error('登录接口返回成功，但二次校验未在线（会话可能未建立）');
+          log(`${lastError.message}，继续重试...`);
+        }
       }
     } catch (err) {
       lastError = err;
@@ -1070,10 +1122,10 @@ async function runLogin(config, options = {}) {
     }
 
     if (attempt < maxRetries) {
-      const waitMs =
-        classifyError(lastError) === 'network'
-          ? Math.min(config.retryDelayMs * Math.pow(1.5, Math.max(0, networkFailures - 1)), 60000)
-          : config.authFailureDelayMs;
+      const treatAsNetwork = transientNoInternet || classifyError(lastError) === 'network';
+      const waitMs = treatAsNetwork
+        ? Math.min(config.retryDelayMs * Math.pow(1.5, Math.max(0, networkFailures - 1)), 60000)
+        : config.authFailureDelayMs;
       log(`等待 ${Math.round(waitMs / 1000)} 秒后进行重试...`);
       await sleep(waitMs);
     }
@@ -1147,6 +1199,108 @@ async function checkInternetAccess(config) {
     }
   }
   return { ok: false, detail: failures.join('；') || '所有探测地址均失败' };
+}
+
+/**
+ * 门户认为「在线」但外网实际被拦截时，等待数据面恢复：
+ * 每 intervalMs 复查一次外网，最多 attempts 次，恢复即返回成功。
+ */
+async function waitForInternetRecovery(config, { attempts = 2, intervalMs = 15000 } = {}) {
+  let last = await checkInternetAccess(config);
+  const total = Math.max(1, attempts);
+  for (let i = 1; i <= total && !last.ok; i += 1) {
+    if (i === total) break;
+    await sleep(intervalMs);
+    last = await checkInternetAccess(config);
+    if (!last.ok) log(`外网仍不可达，稍后继续复查（第 ${i}/${total - 1} 次）...`);
+  }
+  return last;
+}
+
+/**
+ * 请求门户注销当前会话（best effort）：部分「假在线」状态需要先注销，
+ * 门户才会在下次跳转时重新下发实时认证参数。
+ * 门户接口：POST /eportal/InterFace.do?method=logout，body userIndex=<...>。
+ * 注意：部分校园网开了 MAB（MAC 免认证），注销后可能被立即重新认证，属正常现象。
+ */
+async function logoutPortal(config, userIndex) {
+  const body = `userIndex=${encodeURIComponent(userIndex || '')}`;
+  const res = await networkClient.request(
+    {
+      host: config.serverHost,
+      port: config.portalPort,
+      timeoutMs: config.requestTimeoutMs,
+      path: '/eportal/InterFace.do?method=logout',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }
+    },
+    body
+  );
+  let parsed = null;
+  try {
+    parsed = JSON.parse(res.body || '{}');
+  } catch (err) {
+    parsed = null;
+  }
+  return {
+    ok: !!(parsed && parsed.result === 'success'),
+    status: res.statusCode,
+    message: (parsed && parsed.message) || String(res.body || '').slice(0, 80) || '接口无返回内容'
+  };
+}
+
+// 「门户假在线」等待恢复的结果，供 runLogin 判断下一步
+let staleSessionRecovered = false;
+let staleSessionNeedsRelogin = false;
+
+/**
+ * 处理「门户说在线、外网不可达」：先尝试注销会话，再按 internetRetryCount 耐心等待数据面放行。
+ * - 外网恢复：置 staleSessionRecovered=true
+ * - 门户转为未登录：置 staleSessionNeedsRelogin=true（可重新抓参数认证）
+ * - 一直卡住：两者都为 false，由调用方返回退出码 2
+ */
+async function recoverFromStalePortalSession(config, status, options = {}) {
+  staleSessionRecovered = false;
+  staleSessionNeedsRelogin = false;
+  const userIndex = (status && status.userInfo && status.userInfo.userIndex) || '';
+  try {
+    const logout = await logoutPortal(config, userIndex);
+    if (logout.ok) {
+      log(`已请求门户注销当前会话（${logout.message}），等待门户重新分配认证状态...`);
+    } else {
+      log(`门户注销请求未生效（${logout.message}），改为等待数据面恢复...`);
+    }
+  } catch (err) {
+    log(`门户注销请求异常（${err.message}），改为等待数据面恢复...`);
+  }
+  await sleep(Math.min(1500, Math.max(200, Number(config.internetRetryDelayMs) || 15000)));
+
+  const attempts = Math.max(1, Number(config.internetRetryCount) || 6);
+  const intervalMs = Math.max(200, Number(config.internetRetryDelayMs) || 15000);
+  for (let i = 1; i <= attempts; i += 1) {
+    const online = await checkIsOnline(config);
+    if (!online.online) {
+      staleSessionNeedsRelogin = true;
+      log(`第 ${i}/${attempts} 次复查：门户已不再认为本机在线，可以重新抓取参数认证。`);
+      return;
+    }
+    const internet = await checkInternetAccess(config);
+    if (internet.ok) {
+      staleSessionRecovered = true;
+      markBootHandled(config, options);
+      log(`第 ${i}/${attempts} 次复查：外网已恢复可达（${internet.detail}）。`);
+      return;
+    }
+    if (i < attempts) {
+      log(
+        `第 ${i}/${attempts} 次复查：门户仍显示在线，但外网仍不可达，${Math.round(intervalMs / 1000)} 秒后继续等待...`
+      );
+      await sleep(intervalMs);
+    }
+  }
+  log(
+    `已复查 ${attempts} 次外网仍不可达：门户会话可能卡在认证网关侧（常见于刚开机、网关尚未放行），稍后重新运行即可。`
+  );
 }
 
 /**
@@ -1293,5 +1447,8 @@ module.exports = {
   shouldAutoEnable,
   sleep,
   stripQueryString,
-  waitForCampusIpWithRenew
+  logoutPortal,
+  recoverFromStalePortalSession,
+  waitForCampusIpWithRenew,
+  waitForInternetRecovery
 };

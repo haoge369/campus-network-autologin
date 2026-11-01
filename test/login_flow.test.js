@@ -37,7 +37,13 @@ function startFakePortal(options = {}) {
     loginSucceeds: options.loginSucceeds !== false,
     verifyStaysOffline: Boolean(options.verifyStaysOffline),
     genericRedirect: Boolean(options.genericRedirect),
-    pageInfoEmpty: Boolean(options.pageInfoEmpty)
+    pageInfoEmpty: Boolean(options.pageInfoEmpty),
+    // 模拟「刚开机、认证网关还没放行」：前 N 次外网探测返回被劫持页面
+    internetBlockedChecks: Number(options.internetBlockedChecks) || 0,
+    internetChecks: 0,
+    // 门户注销接口是否真的会结束会话（默认只是回 success，不影响状态）
+    logoutWorks: Boolean(options.logoutWorks),
+    logoutCalls: 0
   };
 
   const server = http.createServer((req, res) => {
@@ -99,6 +105,23 @@ function startFakePortal(options = {}) {
         return json({ result: 'fail' });
       }
 
+      // 外网可达性探测目标：前 internetBlockedChecks 次返回被门户劫持的页面
+      if (req.method === 'GET' && url.pathname === '/__internet') {
+        state.internetChecks += 1;
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=UTF-8' });
+        if (state.internetChecks <= state.internetBlockedChecks) {
+          return res.end('<html>请先登录校园网</html>');
+        }
+        return res.end('Microsoft Connect Test');
+      }
+
+      // 门户注销接口
+      if (url.pathname === '/eportal/InterFace.do' && method === 'logout') {
+        state.logoutCalls += 1;
+        if (state.logoutWorks) state.loggedIn = false;
+        return json({ result: 'success', message: '下线成功！' });
+      }
+
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('not found');
     });
@@ -119,6 +142,10 @@ function configFor(port, extra = {}) {
     portalPort: port,
     manageAdapter: false,
     probeUrls: [],
+    // 用假门户自己的 /__internet 当外网探测点，测试不依赖真实外网
+    internetProbes: [
+      { url: `http://127.0.0.1:${port}/__internet`, contains: 'Microsoft Connect Test' }
+    ],
     defaultQueryString: '',
     retryCount: 2,
     retryDelayMs: 50,
@@ -215,6 +242,60 @@ test('假门户：门户已在线导致 pageInfo 空响应 → 复核在线后�
     // 空 pageInfo 说明确实走到了「已在线」这条补偿分支，而不是正常登录
     assert.strictEqual(portal.state.pageInfoBodies.length, 1);
     assert.strictEqual(portal.state.loginBodies.length, 0);
+  } finally {
+    portal.server.close();
+  }
+});
+
+test('假门户：门户说在线但外网暂不可达（刚开机网关未放行）→ 等待后恢复，退出码 0', async () => {
+  const portal = await startFakePortal({ internetBlockedChecks: 2 });
+  try {
+    portal.state.loggedIn = true;
+    const config = configFor(portal.port, {
+      internetRetryCount: 3,
+      internetRetryDelayMs: 20
+    });
+    const result = await cl.runLogin(config, { force: false });
+    assert.strictEqual(result.code, cl.EXIT.OK);
+    assert.strictEqual(result.reason, 'already-online-recovered');
+    assert.ok(portal.state.internetChecks >= 3, '应多次复查外网');
+    assert.strictEqual(portal.state.loginBodies.length, 0, '外网恢复后不该再发起重复认证');
+    const logText = fs.readFileSync(process.env.CAMPUS_LOGIN_LOG, 'utf8');
+    assert.match(logText, /外网已恢复可达/);
+  } finally {
+    portal.server.close();
+  }
+});
+
+test('假门户：门户假在线一直不恢复 → 退出码 2（网络未就绪）', async () => {
+  const portal = await startFakePortal({ internetBlockedChecks: 99 });
+  try {
+    portal.state.loggedIn = true;
+    const config = configFor(portal.port, {
+      internetRetryCount: 2,
+      internetRetryDelayMs: 10
+    });
+    const result = await cl.runLogin(config, { force: false });
+    assert.strictEqual(result.code, cl.EXIT.NETWORK_NOT_READY);
+    assert.strictEqual(result.reason, 'portal-stale-session');
+  } finally {
+    portal.server.close();
+  }
+});
+
+test('假门户：门户假在线但注销成功转为离线 → 自动重新认证登录成功（退出码 0）', async () => {
+  const portal = await startFakePortal({ internetBlockedChecks: 1, logoutWorks: true });
+  try {
+    portal.state.loggedIn = true;
+    const config = configFor(portal.port, {
+      internetRetryCount: 3,
+      internetRetryDelayMs: 10
+    });
+    const result = await cl.runLogin(config, { force: false });
+    assert.strictEqual(result.code, cl.EXIT.OK);
+    assert.strictEqual(result.reason, 'logged-in');
+    assert.strictEqual(portal.state.logoutCalls, 1);
+    assert.strictEqual(portal.state.loginBodies.length, 1);
   } finally {
     portal.server.close();
   }
