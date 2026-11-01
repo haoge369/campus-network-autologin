@@ -18,8 +18,10 @@ Windows 上的免干预校园网登录工具：**每次开机登录 Windows 后�
   （手动双击 `run_now.vbs` 仍会立刻启用并登录，下次开机恢复自动启用）
 - **外网可达性校验**：门户说「在线」时再探测真实外网（`connecttest.txt` / `generate_204`），
   门户假在线、被劫持或外网不通时不会误报成功；刚开机网关还没放行时会自动等待复查
-  （v1.1.4 起，手动运行最多约 2 分钟、开机计划任务最多约 3 分钟，必要时尝试注销旧会话重新认证），
-  仍不可达才返回退出码 2
+  （v1.1.4 起，手动运行最多约 2 分钟、开机计划任务最多约 3 分钟），仍不可达才返回退出码 2
+- **浏览器式重新认证（v1.1.6）**：按浏览器的跳转链（`/` → `redirectortosuccess.jsp` →
+  `index.jsp?<实时参数>`）抓参数；`pageInfo` 返回空时先打开带参数的登录页建立会话（拿
+  `JSESSIONID`）再重试；等待期间一旦抓到实时参数就**主动重新认证**，不再干等网关放行
 - 计划任务以最高权限静默运行（登录后 15 秒一次；每天 06:10 一次）
 - 单实例锁：多次双击也只会真正跑一个登录进程
 - 登录后二次校验，避免「接口说成功、实际没在线」的假成功
@@ -93,7 +95,7 @@ campus-network-autologin/
 `--status` 输出示例（一行 JSON，便于外部脚本消费）：
 
 ```json
-{"version":"1.1.5","time":"2026-10-31 22:32:33","serverHost":"172.10.110.252","adapterMatch":"Realtek PCIe 2.5GbE","autoEnable":"once","nic":{"name":"以太网","state":"enabled","status":"Up","address":"172.10.1.100","mac":"001122334455"},"ip":"172.10.1.100","online":true,"unreachable":false,"internet":true}
+{"version":"1.1.6","time":"2026-10-31 22:32:33","serverHost":"172.10.110.252","adapterMatch":"Realtek PCIe 2.5GbE","autoEnable":"once","nic":{"name":"以太网","state":"enabled","status":"Up","address":"172.10.1.100","mac":"001122334455"},"ip":"172.10.1.100","online":true,"unreachable":false,"internet":true}
 ```
 
 （示例中的 IP / MAC 为虚构值，避免泄露真实网络标识。）
@@ -212,6 +214,17 @@ v1.1.3 起 `CampusLogin_AutoStartup` **只在登录后 15 秒触发一次**，�
    - 始终不通 → 退出码 2，日志说明可能卡在网关侧，稍后重新运行即可。
 7. 因此刚开机时手动双击 `run_now.vbs` 可能等 1~2 分钟才弹结果，这是正常的“等网关放行”。
 
+**v1.1.6 起：不再只是「干等」，而是按浏览器的办法重新认证。** 官方网页登录的实际链路是
+`GET /` → `302 redirectortosuccess.jsp` → `302 index.jsp?<wlanuserip=...&mac=...>`；
+旧代码只看第一跳，遇到 `redirectortosuccess` 就放弃抓参数，于是半在线时永远只能等。
+
+8. 现在会跟完整跳转链（最多 6 跳、浏览器 UA），任何一跳的 `Location` 或登录页 HTML 里出现
+   门户参数都会被抓到；真在线时链会落到 `success.jsp?userIndex=...`，不会误报成参数；
+9. `pageInfo` 返回空时，先 `GET /eportal/index.jsp?<参数>` 打开登录页建立会话（自动保存
+   `JSESSIONID`），再重试 `pageInfo`，拿到公钥就正常提交认证；
+10. 等待复查阶段每轮都会重新抓参数：抓到就主动重新认证一次（成功后复查外网），
+    抓不到才继续等网关放行。
+
 ## 计划任务
 
 `setup_tasks.ps1` 注册两个任务（均 `RunLevel Highest`、隐藏窗口、单实例 `IgnoreNew`）：
@@ -292,7 +305,7 @@ v1.1.1 及更早版本的 `run_silent.vbs` 是以 UTF-8（无 BOM）保存的，
 
 ```powershell
 npm run check   # 语法检查
-npm test        # node:test 单元测试 + 假门户集成测试（零依赖，共 51 个用例）
+npm test        # node:test 单元测试 + 假门户集成测试（零依赖，共 55 个用例）
 npm run diag    # 网卡 / PnP / IP 诊断
 ```
 

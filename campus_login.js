@@ -22,7 +22,7 @@ const networkClient = require('./network_client');
 const { encryptPassword } = require('./rsa_util');
 const nicCtl = require('./nic_ctl');
 
-const APP_VERSION = '1.1.5';
+const APP_VERSION = '1.1.6';
 const SCRIPT_DIR = __dirname;
 const CONFIG_PATH = process.env.CAMPUS_LOGIN_CONFIG
   ? path.resolve(process.env.CAMPUS_LOGIN_CONFIG)
@@ -527,6 +527,108 @@ function buildPortalUrl(config) {
   return `http://${config.serverHost}${port === 80 ? '' : ':' + port}/`;
 }
 
+// 门户的浏览器流程是：GET / → 302 redirectortosuccess.jsp → 302 index.jsp?<实时参数>。
+// 只请求第一跳会漏掉真正的参数页（刚开机「半在线」时尤其明显），所以要跟完整跳转链。
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const BROWSER_HEADERS = Object.freeze({
+  'User-Agent': BROWSER_UA,
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+});
+
+/** 把 Location 相对路径解析成绝对 URL，失败返回 null。 */
+function resolveUrl(baseUrl, location) {
+  try {
+    return new URL(location, baseUrl).toString();
+  } catch (err) {
+    return null;
+  }
+}
+
+/** 日志里用的短 URL：保留主机+路径，query 截断。 */
+function shortUrl(urlString) {
+  if (!urlString) return '';
+  try {
+    const u = new URL(urlString);
+    const query = u.search ? `?${u.search.slice(1, 61)}${u.search.length > 61 ? '...' : ''}` : '';
+    return `${u.host}${u.pathname}${query}`;
+  } catch (err) {
+    return String(urlString).slice(0, 120);
+  }
+}
+
+/** 从登录页 HTML 兜底提取 queryString（有的门户把参数写在隐藏表单里）。 */
+function extractQueryStringFromHtml(html) {
+  if (!html) return null;
+  const patterns = [
+    /name=["']queryString["'][^>]*value=["']([^"']+)["']/i,
+    /value=["']([^"']*wlanuserip=[^"']*)["']/i,
+    /(wlanuserip=[0-9a-zA-Z._%-]+(?:&[^"'\s<>]*)?)/i
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(html);
+    if (!match) continue;
+    let value = match[1];
+    try {
+      value = decodeURIComponent(value);
+    } catch (err) {
+      // 保留原值
+    }
+    if (isPortalQueryString(value)) return value;
+  }
+  return null;
+}
+
+/**
+ * 跟随门户跳转链（最多 6 跳），从任意一跳的 Location 或登录页 HTML 里取实时参数。
+ * 典型链：/ → redirectortosuccess.jsp → index.jsp?wlanuserip=...&mac=...
+ * 真正在线时链会落到 success.jsp?userIndex=...，此时没有认证参数。
+ */
+async function followPortalChain(startUrl, config, maxHops = 6) {
+  let currentUrl = startUrl;
+  const hops = [];
+  for (let hop = 0; hop < maxHops; hop += 1) {
+    let res;
+    try {
+      res = await networkClient.requestUrl(currentUrl, {
+        method: 'GET',
+        timeoutMs: Math.min(config.requestTimeoutMs, 5000),
+        headers: { ...BROWSER_HEADERS }
+      });
+    } catch (err) {
+      return { hops, error: err };
+    }
+    const location = (res.headers && res.headers.location) || '';
+    hops.push({ url: currentUrl, status: res.statusCode, location });
+
+    const queryString = stripQueryString(location);
+    if (queryString && isPortalQueryString(queryString)) {
+      return { hops, queryString, sourceUrl: location };
+    }
+    if (!location) {
+      const fromHtml = extractQueryStringFromHtml(res.body || '');
+      return { hops, queryString: fromHtml, sourceUrl: currentUrl };
+    }
+    if (/success\.jsp/i.test(location) && !/redirectortosuccess/i.test(location)) {
+      // 门户自己的成功页：说明此刻已在线，这里没有新的认证参数
+      return { hops, online: true, sourceUrl: location };
+    }
+    if (queryString) {
+      return { hops, nonPortal: true, sourceUrl: location };
+    }
+    const nextUrl = resolveUrl(currentUrl, location);
+    if (!nextUrl) return { hops, nonPortal: true, sourceUrl: location };
+    currentUrl = nextUrl;
+  }
+  return { hops };
+}
+
+/**
+ * 实时抓取 queryString：先跟门户网关的跳转链（浏览器同款），再依次尝试配置的探测地址。
+ * @returns {Promise<{queryString:string, source:string}|null>}
+ */
 async function detectQueryString(config) {
   const candidates = [{ label: `门户网关 ${config.serverHost}`, url: buildPortalUrl(config) }];
   for (const probe of config.probeUrls || []) {
@@ -535,31 +637,25 @@ async function detectQueryString(config) {
 
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index];
-    try {
-      const res = await networkClient.requestUrl(candidate.url, {
-        method: 'GET',
-        timeoutMs: index === 0 ? config.requestTimeoutMs : Math.min(config.requestTimeoutMs, 3000)
-      });
-      const location = res.headers && res.headers.location;
-      const queryString = stripQueryString(location);
+    const chain = await followPortalChain(candidate.url, config, 6);
+    const hops = chain.hops || [];
+    const chainText = hops
+      .map((hop) => `${hop.status}${hop.location ? ` → ${shortUrl(hop.location)}` : ''}`)
+      .join(' | ');
 
-      if (queryString && isPortalQueryString(queryString)) {
-        log(`重定向捕获成功（${candidate.label}）: ${location}`);
-        return { queryString, source: candidate.label };
-      }
-
-      // 门户把根路径跳到 redirectortosuccess 说明此刻已经在线，
-      // 不会再下发新的 queryString，继续探测只会白等。
-      if (index === 0 && location && location.includes('redirectortosuccess')) {
-        log('门户返回「已登录」跳转（redirectortosuccess），当前无法获取实时参数。');
-        return null;
-      }
-
-      if (queryString) {
-        log(`忽略非门户重定向（${candidate.label}）: ${location}`);
-      }
-    } catch (err) {
-      log(`探测 ${candidate.label} 失败: ${err.message}`);
+    if (chain.queryString) {
+      log(`实时参数捕获成功（${candidate.label}）: ${shortUrl(chain.sourceUrl || '')}`);
+      if (hops.length > 1) log(`跳转链: ${chainText}`);
+      return { queryString: chain.queryString, source: candidate.label };
+    }
+    if (hops.length > 0) log(`探测链（${candidate.label}）: ${chainText}`);
+    if (chain.error) {
+      log(`探测 ${candidate.label} 失败: ${chain.error.message}`);
+    } else if (chain.online) {
+      log('门户跳转到了成功页（redirectortosuccess → success.jsp），当前已在线，没有新的认证参数。');
+      return null;
+    } else if (chain.nonPortal) {
+      log(`忽略非门户重定向（${candidate.label}）: ${chain.sourceUrl || ''}`);
     }
   }
   return null;
@@ -597,6 +693,28 @@ async function fetchPageInfo(config, queryString) {
 }
 
 /**
+ * 按浏览器流程打开带实时参数的登录页：让门户建立会话（下发 JSESSIONID），
+ * 之后 pageInfo 才能在「半在线」状态下正常下发公钥。
+ */
+async function openLoginPage(config, queryString) {
+  if (!queryString) return false;
+  const base = buildPortalUrl(config).replace(/\/+$/, '');
+  const url = `${base}/eportal/index.jsp?${queryString}`;
+  try {
+    const res = await networkClient.requestUrl(url, {
+      method: 'GET',
+      timeoutMs: config.requestTimeoutMs,
+      headers: { ...BROWSER_HEADERS }
+    });
+    log(`已按浏览器流程打开门户登录页（HTTP ${res.statusCode}，${(res.body || '').length} 字节）。`);
+    return res.statusCode === 200;
+  } catch (err) {
+    log(`打开门户登录页失败（${err.message}）。`);
+    return false;
+  }
+}
+
+/**
  * 发起一次认证登录。
  * @returns {Promise<{ok:true, userIndex?:string, macSource:string}>}
  */
@@ -605,13 +723,28 @@ async function doLogin(config, queryString) {
   try {
     pageInfo = await fetchPageInfo(config, queryString);
   } catch (err) {
-    // pageInfo 空响应通常意味着门户已认为设备在线（不再下发新参数）。
-    // 先复核在线状态，确认在线就直接按成功处理，避免把「已在线」误报成登录失败。
     if (err instanceof AuthError && /pageInfo 返回空响应/.test(err.message)) {
-      const current = await checkIsOnline(config);
-      if (current.online) return { ok: true, alreadyOnline: true, userIndex: null };
+      // 复刻浏览器：先打开带参数的登录页建立会话，再重试 pageInfo。
+      // 门户「半在线」时这样就能拿到公钥并真正完成认证，而不是干等网关放行。
+      log('pageInfo 返回空响应，按浏览器流程先打开登录页刷新会话，再重试获取公钥...');
+      const warmed = await openLoginPage(config, queryString);
+      if (warmed) {
+        try {
+          pageInfo = await fetchPageInfo(config, queryString);
+          log('打开登录页后已获取到公钥，继续提交认证。');
+        } catch (retryErr) {
+          pageInfo = null;
+          log(`打开登录页后仍无法获取公钥（${retryErr.message}）。`);
+        }
+      }
+      if (!pageInfo) {
+        const current = await checkIsOnline(config);
+        if (current.online) return { ok: true, alreadyOnline: true, userIndex: null };
+        throw err;
+      }
+    } else {
+      throw err;
     }
-    throw err;
   }
 
   const exponent = pageInfo.publicKeyExponent || '10001';
@@ -1287,6 +1420,35 @@ async function recoverFromStalePortalSession(config, status, options = {}) {
       log(`第 ${i}/${attempts} 次复查：门户已不再认为本机在线，可以重新抓取参数认证。`);
       return;
     }
+
+    // 不干等网关放行：像浏览器一样再抓一次实时参数，抓到就主动重新认证。
+    const detected = await detectQueryString(config);
+    if (detected && detected.queryString) {
+      log(`第 ${i}/${attempts} 次复查：抓到实时参数，主动重新认证一次...`);
+      try {
+        const login = await doLogin(config, detected.queryString);
+        if (login.ok && !login.alreadyOnline) {
+          await sleep(Math.min(2000, Math.max(200, Number(config.verifyAfterLoginMs) || 1500)));
+          const after = await checkInternetAccess(config);
+          if (after.ok) {
+            staleSessionRecovered = true;
+            markBootHandled(config, options);
+            log(`第 ${i}/${attempts} 次复查：重新认证后外网已恢复可达（${after.detail}）。`);
+            return;
+          }
+          log(`第 ${i}/${attempts} 次复查：重新认证成功，但外网仍不可达，继续尝试...`);
+        } else if (login.alreadyOnline) {
+          log(`第 ${i}/${attempts} 次复查：门户仍认为本机在线且未下发新参数，继续等待数据面放行...`);
+        } else {
+          log(`第 ${i}/${attempts} 次复查：重新认证未成功（${login.message || '未知原因'}），继续等待...`);
+        }
+      } catch (err) {
+        log(`第 ${i}/${attempts} 次复查：主动重新认证失败（${err.message}），继续等待...`);
+      }
+    } else {
+      log(`第 ${i}/${attempts} 次复查：暂时抓不到实时参数（门户仍认为在线），继续等待数据面放行...`);
+    }
+
     const internet = await checkInternetAccess(config);
     if (internet.ok) {
       staleSessionRecovered = true;
@@ -1295,9 +1457,7 @@ async function recoverFromStalePortalSession(config, status, options = {}) {
       return;
     }
     if (i < attempts) {
-      log(
-        `第 ${i}/${attempts} 次复查：门户仍显示在线，但外网仍不可达，${Math.round(intervalMs / 1000)} 秒后继续等待...`
-      );
+      log(`第 ${i}/${attempts} 次复查：外网仍不可达，${Math.round(intervalMs / 1000)} 秒后继续...`);
       await sleep(intervalMs);
     }
   }

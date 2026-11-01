@@ -34,6 +34,39 @@ const NETWORK_ERROR_CODES = new Set([
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
+// --- 极简 Cookie 会话保持 -------------------------------------------------
+// 门户登录页会下发 JSESSIONID；部分状态下 pageInfo 只认「先打开过登录页」的会话。
+// 这里按 host:port 保存 name=value，探测/登录链路会自动带上，便于复刻浏览器行为。
+const cookieJar = new Map();
+
+function cookieKey(host, port) {
+  return `${host}:${port || 80}`;
+}
+
+function rememberSetCookies(key, setCookieHeader) {
+  if (!setCookieHeader) return;
+  const lines = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+  const jar = cookieJar.get(key) || new Map();
+  for (const line of lines) {
+    const pair = String(line).split(';')[0] || '';
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+  if (jar.size > 0) cookieJar.set(key, jar);
+}
+
+function buildCookieHeader(key) {
+  const jar = cookieJar.get(key);
+  if (!jar || jar.size === 0) return '';
+  return [...jar.entries()].map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
+/** 清空 cookie 会话（测试用，避免用例之间串味）。 */
+function resetCookieJar() {
+  cookieJar.clear();
+}
+
 /**
  * 把 os.networkInterfaces() 的结果拍平成数组。
  * @returns {Array<{name:string,address:string,family:string,mac:string,internal:boolean,cidr:string|null}>}
@@ -143,6 +176,7 @@ function sendOnce(options, body = null) {
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
 
   return new Promise((resolve, reject) => {
+    const jarKey = cookieKey(host, port);
     const reqOptions = {
       host,
       port,
@@ -150,6 +184,10 @@ function sendOnce(options, body = null) {
       method,
       headers: { ...(options.headers || {}) }
     };
+    if (!reqOptions.headers.Cookie && !reqOptions.headers.cookie) {
+      const cookieHeader = buildCookieHeader(jarKey);
+      if (cookieHeader) reqOptions.headers.Cookie = cookieHeader;
+    }
     if (options.localAddress) reqOptions.localAddress = options.localAddress;
     if (body !== null && body !== undefined) {
       reqOptions.headers['Content-Length'] = Buffer.byteLength(body);
@@ -159,6 +197,7 @@ function sendOnce(options, body = null) {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
+        rememberSetCookies(jarKey, res.headers['set-cookie']);
         resolve({
           statusCode: res.statusCode,
           headers: res.headers,
@@ -240,5 +279,6 @@ module.exports = {
   isNetworkError,
   sendOnce,
   request,
-  requestUrl
+  requestUrl,
+  resetCookieJar
 };

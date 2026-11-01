@@ -43,7 +43,13 @@ function startFakePortal(options = {}) {
     internetChecks: 0,
     // 门户注销接口是否真的会结束会话（默认只是回 success，不影响状态）
     logoutWorks: Boolean(options.logoutWorks),
-    logoutCalls: 0
+    logoutCalls: 0,
+    // 模拟真实浏览器链路：/ → redirectortosuccess.jsp → index.jsp?<实时参数>
+    chainToLoginPage: Boolean(options.chainToLoginPage),
+    // 模拟「pageInfo 需要先打开过登录页（带 JSESSIONID）才会下发公钥」
+    pageInfoNeedsCookie: Boolean(options.pageInfoNeedsCookie),
+    indexPageVisits: 0,
+    pageInfoCalls: 0
   };
 
   const server = http.createServer((req, res) => {
@@ -68,14 +74,35 @@ function startFakePortal(options = {}) {
         if (state.genericRedirect) {
           return redirect('http://go.microsoft.com/fwlink/?LinkID=219472&clcid=0x409');
         }
+        if (state.chainToLoginPage) {
+          // 浏览器实际看到的链路：先跳 redirectortosuccess.jsp，再跳登录页
+          return redirect(`${base}/eportal/redirectortosuccess.jsp`);
+        }
         if (state.loggedIn && !state.verifyStaysOffline) {
           return redirect(`${base}/eportal/redirectortosuccess.jsp`);
         }
         return redirect(`${base}/eportal/index.jsp?${PORTAL_QUERY}`);
       }
 
+      // 带参数的登录页：真实门户会在这里下发 JSESSIONID，页面 JS 再用参数调 pageInfo
+      if (req.method === 'GET' && url.pathname === '/eportal/index.jsp') {
+        state.indexPageVisits += 1;
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=UTF-8',
+          'Set-Cookie': 'JSESSIONID=FAKE-SESSION; Path=/eportal; HttpOnly'
+        });
+        return res.end('<html><body><form id="login"></form></body></html>');
+      }
+
       if (url.pathname === '/eportal/InterFace.do' && method === 'pageInfo') {
         state.pageInfoBodies.push(body);
+        state.pageInfoCalls += 1;
+        const hasSession = /JSESSIONID=/.test(req.headers.cookie || '');
+        if (state.pageInfoNeedsCookie && !hasSession) {
+          // 半在线状态下，没先打开登录页时 pageInfo 会返回空响应
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=UTF-8' });
+          return res.end('');
+        }
         if (state.loggedIn && state.pageInfoEmpty) {
           // 真实门户在「已在线」时对 pageInfo 返回空响应（不再下发公钥参数）
           res.writeHead(200, { 'Content-Type': 'text/plain; charset=UTF-8' });
@@ -99,6 +126,10 @@ function startFakePortal(options = {}) {
       }
 
       if (url.pathname === '/eportal/redirectortosuccess.jsp') {
+        if (state.chainToLoginPage) {
+          // 半在线：门户认为在线，但会把浏览器再送回带实时参数的登录页
+          return redirect(`${base}/eportal/index.jsp?${PORTAL_QUERY}`);
+        }
         if (state.loggedIn && !state.verifyStaysOffline) {
           return redirect(`${base}/eportal/success.jsp?userIndex=abc`);
         }
@@ -239,8 +270,9 @@ test('假门户：门户已在线导致 pageInfo 空响应 → 复核在线后�
     const result = await cl.runLogin(config, { force: true });
     assert.strictEqual(result.code, cl.EXIT.OK);
     assert.strictEqual(result.reason, 'already-online');
-    // 空 pageInfo 说明确实走到了「已在线」这条补偿分支，而不是正常登录
-    assert.strictEqual(portal.state.pageInfoBodies.length, 1);
+    // 空 pageInfo 说明确实走到了「已在线」这条补偿分支，而不是正常登录。
+    // 现在会多一次「打开登录页预热会话后重试 pageInfo」，所以是 2 次。
+    assert.strictEqual(portal.state.pageInfoBodies.length, 2);
     assert.strictEqual(portal.state.loginBodies.length, 0);
   } finally {
     portal.server.close();
@@ -296,6 +328,34 @@ test('假门户：门户假在线但注销成功转为离线 → 自动重新认
     assert.strictEqual(result.reason, 'logged-in');
     assert.strictEqual(portal.state.logoutCalls, 1);
     assert.strictEqual(portal.state.loginBodies.length, 1);
+  } finally {
+    portal.server.close();
+  }
+});
+
+test('假门户：半在线时跟随跳转链并预热登录页 → 真正重新认证成功（退出码 0）', async () => {
+  // 复现真实现场：门户根路径 302 → redirectortosuccess.jsp → index.jsp?<参数>，
+  // 且 pageInfo 必须先打开过登录页（有 JSESSIONID）才下发公钥。
+  const portal = await startFakePortal({
+    chainToLoginPage: true,
+    pageInfoNeedsCookie: true,
+    internetBlockedChecks: 1
+  });
+  try {
+    portal.state.loggedIn = true; // 门户认为在线，但外网被网关拦截
+    const config = configFor(portal.port, {
+      internetRetryCount: 3,
+      internetRetryDelayMs: 10
+    });
+    const result = await cl.runLogin(config, { force: false });
+    assert.strictEqual(result.code, cl.EXIT.OK);
+    assert.strictEqual(result.reason, 'already-online-recovered');
+    assert.ok(portal.state.indexPageVisits >= 1, '应打开过带参数的登录页预热会话');
+    assert.strictEqual(portal.state.loginBodies.length, 1, '应真正提交过一次认证');
+    const logText = fs.readFileSync(process.env.CAMPUS_LOGIN_LOG, 'utf8');
+    assert.match(logText, /实时参数捕获成功/);
+    assert.match(logText, /已按浏览器流程打开门户登录页/);
+    assert.match(logText, /重新认证后外网已恢复可达/);
   } finally {
     portal.server.close();
   }

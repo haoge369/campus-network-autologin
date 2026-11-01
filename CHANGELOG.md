@@ -1,5 +1,29 @@
 # 更新记录
 
+## v1.1.6 (2026-11-01)
+
+### 修复
+- **半在线（门户说在线、外网不通）时脚本拿不到参数、不会自己重新认证**：真实现场是
+  浏览器访问门户会走 `GET /` → `302 redirectortosuccess.jsp` → `302 index.jsp?<wlanuserip=...&mac=...>`，
+  用户就是这样在网页里登录成功的；而旧代码只看第一跳，看到 `redirectortosuccess` 就放弃抓参数，
+  于是只能回落到过期参数或干等网关放行。
+  现在按浏览器的办法处理：
+  1. 跟完整跳转链（最多 6 跳、浏览器 UA），从任意一跳的 `Location` 或登录页 HTML 里抓实时参数；
+     链落到 `success.jsp?userIndex=...` 时判定「已在线、没有新参数」，不会误报；
+  2. `pageInfo` 返回空时，先 `GET /eportal/index.jsp?<参数>` 打开登录页建立会话（自动保存
+     `JSESSIONID`，`network_client.js` 新增极简 Cookie jar），再重试 `pageInfo`；
+  3. 等待外网恢复的每轮复查里，一旦抓到实时参数就**主动重新认证一次**（成功后复查外网），
+     而不是只被动等待网关放行；认证成功但外网仍不通时才继续等。
+
+### 新增
+- `network_client.js`：按 `host:port` 的极简 Cookie jar（自动带 `Cookie`、记录 `Set-Cookie`），
+  新增导出 `resetCookieJar()`。
+- `campus_login.js`：新增 `followPortalChain` / `extractQueryStringFromHtml` / `openLoginPage`
+  等浏览器式链路辅助函数。
+- 假门户测试新增 `chainToLoginPage`（复刻 `redirectortosuccess` → `index.jsp?参数` 链路）、
+  `pageInfoNeedsCookie`（未打开登录页时 pageInfo 返回空）两个开关与 1 个端到端用例；
+  测试总数 54 → 55。
+
 ## v1.1.5 (2026-11-01)
 
 ### 修复
