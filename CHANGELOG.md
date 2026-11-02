@@ -1,5 +1,31 @@
 # 更新记录
 
+## v2.0.0 (2026-11-02)
+
+### 变更
+- **登录核心按 v1 的稳定流程重构**（用户反馈「v1 可以正常登录」）：
+  1. 在线判定改为只认门户会话——`getOnlineUserInfo` 返回带 `userIndex` 即视为在线（`result:"wait"` 的半在线状态也算），
+     门户回 `{"result":"fail"}`（无 `userIndex`）才算离线；
+  2. 实时参数只从配置的探测地址（`probeUrls`，默认 `1.1.1.1` 等）的 302 `Location` 里取，
+     不再跟随门户跳转链、不再解析登录页 HTML——这两种「猜测」会拿到 `123.123.123.123` 之类的无关参数；
+  3. 已在线则立即退出（退出码 0），不再额外探测外网、不再等待/重试；
+  4. 未在线则按 v1 语义连续重试（默认 3 次、间隔 5 秒），登录接口成功后做一次「二次校验」；
+  5. 抓不到实时参数时回落到 `defaultQueryString`，仍没有才报配置错误（退出码 3）。
+
+### 移除
+- 删除 v1.1.4–v1.1.6 的猜测性逻辑：`waitForInternetRecovery`、`recoverFromStalePortalSession`、
+  `logoutPortal`、`followPortalChain`、`extractQueryStringFromHtml`、`resolveUrl`、
+  `internetRetryCount` / `internetRetryDelayMs` / `authFailureDelayMs` 配置项。
+- 外网探测不再参与登录判定，只在 `--status` 输出 `internet` 字段用于诊断。
+
+### 保留
+- 网卡自愈（设备管理器 / 网络连接两种禁用都支持）、每次开机只自动登录一次、尊重手动禁用、
+  `--daily` 每日确认、快速启动开机识别、日志轮转、单实例锁、DPAPI 密码、计划任务与启动器。
+
+### 测试
+- 假门户用例按 v1 语义更新（探测地址改为假门户根路径），删除「假在线等待 / 注销 / 跳转链」3 类用例；
+  测试总数 55 → 51，全部通过。
+
 ## v1.1.6 (2026-11-01)
 
 ### 修复

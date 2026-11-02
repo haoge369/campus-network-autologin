@@ -172,7 +172,7 @@ function configFor(port, extra = {}) {
     serverHost: '127.0.0.1',
     portalPort: port,
     manageAdapter: false,
-    probeUrls: [],
+    probeUrls: [`http://127.0.0.1:${port}/`],
     // 用假门户自己的 /__internet 当外网探测点，测试不依赖真实外网
     internetProbes: [
       { url: `http://127.0.0.1:${port}/__internet`, contains: 'Microsoft Connect Test' }
@@ -274,88 +274,6 @@ test('假门户：门户已在线导致 pageInfo 空响应 → 复核在线后�
     // 现在会多一次「打开登录页预热会话后重试 pageInfo」，所以是 2 次。
     assert.strictEqual(portal.state.pageInfoBodies.length, 2);
     assert.strictEqual(portal.state.loginBodies.length, 0);
-  } finally {
-    portal.server.close();
-  }
-});
-
-test('假门户：门户说在线但外网暂不可达（刚开机网关未放行）→ 等待后恢复，退出码 0', async () => {
-  const portal = await startFakePortal({ internetBlockedChecks: 2 });
-  try {
-    portal.state.loggedIn = true;
-    const config = configFor(portal.port, {
-      internetRetryCount: 3,
-      internetRetryDelayMs: 20
-    });
-    const result = await cl.runLogin(config, { force: false });
-    assert.strictEqual(result.code, cl.EXIT.OK);
-    assert.strictEqual(result.reason, 'already-online-recovered');
-    assert.ok(portal.state.internetChecks >= 3, '应多次复查外网');
-    assert.strictEqual(portal.state.loginBodies.length, 0, '外网恢复后不该再发起重复认证');
-    const logText = fs.readFileSync(process.env.CAMPUS_LOGIN_LOG, 'utf8');
-    assert.match(logText, /外网已恢复可达/);
-  } finally {
-    portal.server.close();
-  }
-});
-
-test('假门户：门户假在线一直不恢复 → 退出码 2（网络未就绪）', async () => {
-  const portal = await startFakePortal({ internetBlockedChecks: 99 });
-  try {
-    portal.state.loggedIn = true;
-    const config = configFor(portal.port, {
-      internetRetryCount: 2,
-      internetRetryDelayMs: 10
-    });
-    const result = await cl.runLogin(config, { force: false });
-    assert.strictEqual(result.code, cl.EXIT.NETWORK_NOT_READY);
-    assert.strictEqual(result.reason, 'portal-stale-session');
-  } finally {
-    portal.server.close();
-  }
-});
-
-test('假门户：门户假在线但注销成功转为离线 → 自动重新认证登录成功（退出码 0）', async () => {
-  const portal = await startFakePortal({ internetBlockedChecks: 1, logoutWorks: true });
-  try {
-    portal.state.loggedIn = true;
-    const config = configFor(portal.port, {
-      internetRetryCount: 3,
-      internetRetryDelayMs: 10
-    });
-    const result = await cl.runLogin(config, { force: false });
-    assert.strictEqual(result.code, cl.EXIT.OK);
-    assert.strictEqual(result.reason, 'logged-in');
-    assert.strictEqual(portal.state.logoutCalls, 1);
-    assert.strictEqual(portal.state.loginBodies.length, 1);
-  } finally {
-    portal.server.close();
-  }
-});
-
-test('假门户：半在线时跟随跳转链并预热登录页 → 真正重新认证成功（退出码 0）', async () => {
-  // 复现真实现场：门户根路径 302 → redirectortosuccess.jsp → index.jsp?<参数>，
-  // 且 pageInfo 必须先打开过登录页（有 JSESSIONID）才下发公钥。
-  const portal = await startFakePortal({
-    chainToLoginPage: true,
-    pageInfoNeedsCookie: true,
-    internetBlockedChecks: 1
-  });
-  try {
-    portal.state.loggedIn = true; // 门户认为在线，但外网被网关拦截
-    const config = configFor(portal.port, {
-      internetRetryCount: 3,
-      internetRetryDelayMs: 10
-    });
-    const result = await cl.runLogin(config, { force: false });
-    assert.strictEqual(result.code, cl.EXIT.OK);
-    assert.strictEqual(result.reason, 'already-online-recovered');
-    assert.ok(portal.state.indexPageVisits >= 1, '应打开过带参数的登录页预热会话');
-    assert.strictEqual(portal.state.loginBodies.length, 1, '应真正提交过一次认证');
-    const logText = fs.readFileSync(process.env.CAMPUS_LOGIN_LOG, 'utf8');
-    assert.match(logText, /实时参数捕获成功/);
-    assert.match(logText, /已按浏览器流程打开门户登录页/);
-    assert.match(logText, /重新认证后外网已恢复可达/);
   } finally {
     portal.server.close();
   }
